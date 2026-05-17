@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "window-frame-monitor"
+version = "0.1.0"
+description = "Local browser monitor for demand-driven window frame streaming"
+requires-python = ">=3.11"
+dependencies = [
+  "opencv-python>=4.13.0.92",
+  "pillow>=10.0",
+  "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+windows = [
+  "pywin32>=306; platform_system == 'Windows'",
+  "mss>=9.0; platform_system == 'Windows'",
+]
+dxgi = [
+  "dxcam>=0.0.5; platform_system == 'Windows'",
+]
+dev = [
+  "pytest>=8.0",
+]
+
+[project.scripts]
+window-frame-monitor = "window_frame_monitor.cli:main"
+window-frame-remote = "window_frame_monitor.remote_stream:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+window_frame_monitor = ["static/*.html", "static/*.js", "static/*.css"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

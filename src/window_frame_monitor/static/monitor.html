@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Window Frame Monitor</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <h1>Window Frame Monitor</h1>
+          <p id="backend-status">Backend waiting</p>
+        </div>
+        <div class="source-toggle" role="group" aria-label="Monitor source">
+          <button id="source-ws" class="active" type="button">WebSocket</button>
+          <button id="source-mjpeg" type="button">MJPEG</button>
+        </div>
+      </header>
+
+      <section class="controls">
+        <select id="window-select" aria-label="Target window"></select>
+        <select id="fps-select" aria-label="Output frame rate">
+          <option value="24">24 FPS</option>
+          <option value="60">60 FPS</option>
+          <option value="custom">Custom</option>
+        </select>
+        <input id="custom-fps" type="number" min="1" max="240" value="60" aria-label="Custom frame rate" />
+        <button id="apply-fps" type="button">Apply FPS</button>
+        <select id="h264-encoder" aria-label="H.264 encoder">
+          <option value="h264_nvenc">H.264 NVENC</option>
+          <option value="libx264">H.264 x264</option>
+        </select>
+        <input id="h264-bitrate" type="number" min="250" max="100000" value="6000" aria-label="H.264 bitrate kbps" />
+        <input id="output-width" type="number" min="16" max="7680" value="1280" aria-label="Output width" />
+        <input id="output-height" type="number" min="16" max="4320" value="720" aria-label="Output height" />
+        <button id="apply-h264" type="button">Apply H.264</button>
+        <button id="match-source-output" type="button">Match Source</button>
+        <button id="reload-windows" type="button">Reload windows</button>
+        <button id="select-window" type="button">Capture</button>
+        <button id="refresh-stream" type="button">Refresh</button>
+        <button id="stop-capture" type="button">Stop</button>
+        <button id="run-h264-test" type="button">Run H.264 Test</button>
+      </section>
+
+      <section class="preview" aria-label="Live preview">
+        <img id="preview-image" alt="Live captured frame" />
+      </section>
+
+      <section class="diagnostics" aria-label="Diagnostics">
+        <section class="metrics" aria-label="Runtime metrics">
+          <div class="metric-group" data-group="runtime">
+            <h2>Runtime</h2>
+            <div><span>Runtime</span><strong id="runtime">0.0s</strong></div>
+            <div><span>FPS</span><strong id="fps">0.0</strong></div>
+            <div><span>Target FPS</span><strong id="target-fps">30</strong></div>
+            <div><span>State</span><strong id="capture-state">idle</strong></div>
+            <div><span>Pipelines</span><strong id="pipelines">none</strong></div>
+          </div>
+          <div class="metric-group" data-group="timing">
+            <h2>Timing</h2>
+            <div><span>Frame</span><strong id="frame-time">0.0 ms</strong></div>
+            <div><span>Capture</span><strong id="capture-ms">0.0 ms</strong></div>
+            <div><span>Encode</span><strong id="encode-ms">0.0 ms</strong></div>
+            <div><span>Serialize</span><strong id="serialize-ms">0.0 ms</strong></div>
+            <div><span>Send</span><strong id="send-ms">0.0 ms</strong></div>
+            <div><span>Average</span><strong id="avg-frame-time">0.0 ms</strong></div>
+            <div><span>Maximum</span><strong id="max-frame-time">0.0 ms</strong></div>
+          </div>
+          <div class="metric-group" data-group="frames">
+            <h2>Frames</h2>
+            <div><span>Dropped</span><strong id="dropped">0</strong></div>
+            <div><span>New/s</span><strong id="new-frames-per-s">0</strong></div>
+            <div><span>Reused/s</span><strong id="reused-frames-per-s">0</strong></div>
+            <div><span>New total</span><strong id="new-frames">0</strong></div>
+            <div><span>Reused total</span><strong id="reused-frames">0</strong></div>
+          </div>
+          <div class="metric-group" data-group="connections">
+            <h2>Connections</h2>
+            <div><span>WS clients</span><strong id="ws-clients">0</strong></div>
+            <div><span>MJPEG clients</span><strong id="mjpeg-clients">0</strong></div>
+          </div>
+          <div class="metric-group" data-group="encoding">
+            <h2>Encoding</h2>
+            <div><span>Codec</span><strong id="video-codec">jpeg</strong></div>
+            <div><span>H.264 encoder</span><strong id="h264-encoder-state">h264_nvenc</strong></div>
+            <div><span>Bitrate</span><strong id="h264-bitrate-state">6000 kbps</strong></div>
+            <div><span>Output</span><strong id="output-size-state">1280x720</strong></div>
+          </div>
+          <div class="metric-group" data-group="h264-probe">
+            <h2>H.264 Probe</h2>
+            <div><span>Status</span><strong id="h264-test-status">idle</strong></div>
+            <div><span>Decoded</span><strong id="h264-test-decoded">0</strong></div>
+            <div><span>Latency</span><strong id="h264-test-latency">0.0 ms</strong></div>
+            <div><span>Maximum</span><strong id="h264-test-max">0.0 ms</strong></div>
+            <div><span>Latest</span><strong id="h264-test-latest">none</strong></div>
+          </div>
+        </section>
+        <section class="logs" aria-label="Logs">
+          <div class="log-panel">
+            <h2>System</h2>
+            <pre id="system-log"></pre>
+          </div>
+          <div class="log-panel">
+            <h2>Events</h2>
+            <pre id="event-log"></pre>
+          </div>
+        </section>
+      </section>
+    </main>
+    <script src="/static/monitor.js"></script>
+  </body>
+</html>
