@@ -45,7 +45,7 @@ def test_change_detector_reports_change_for_different_frames():
 
 
 def test_remote_frame_store_writes_latest_frame_and_state(tmp_path: Path):
-    store = RemoteFrameStore(output_dir=tmp_path, width=16, height=16)
+    store = RemoteFrameStore(output_dir=tmp_path, width=16, height=16, snapshot_fps=30)
     frame = bytes([80, 120, 160]) * (16 * 16)
 
     store.update_frame(frame)
@@ -55,3 +55,25 @@ def test_remote_frame_store_writes_latest_frame_and_state(tmp_path: Path):
     assert state["latest_frame_path"] == str(tmp_path / "latest.jpg")
     assert (tmp_path / "latest.jpg").exists()
     assert (tmp_path / "state.json").exists()
+
+
+def test_remote_frame_store_can_skip_per_frame_snapshots(tmp_path: Path):
+    store = RemoteFrameStore(output_dir=tmp_path, width=16, height=16, snapshot_fps=0)
+    frame = bytes([80, 120, 160]) * (16 * 16)
+
+    store.update_frame(frame)
+    jpeg = store.latest_jpeg()
+
+    assert not (tmp_path / "latest.jpg").exists()
+    assert jpeg is not None
+
+
+def test_remote_frame_store_throttles_change_detection(tmp_path: Path):
+    store = RemoteFrameStore(output_dir=tmp_path, width=16, height=16, change_fps=1, snapshot_fps=0)
+
+    store.update_frame(bytes([0, 0, 0]) * (16 * 16))
+    store.update_frame(bytes([255, 255, 255]) * (16 * 16))
+    state = store.state()
+
+    assert state["frame_count"] == 2
+    assert state["change_score"] == 1.0
