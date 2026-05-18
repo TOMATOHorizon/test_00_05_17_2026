@@ -13,6 +13,7 @@ from io import BytesIO
 from pathlib import Path
 from time import perf_counter, perf_counter_ns, sleep
 from typing import BinaryIO
+from urllib.parse import urlparse
 
 from PIL import Image
 
@@ -249,6 +250,7 @@ class RemoteH264Receiver:
         self._stream_thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._network_times: deque[tuple[float, int]] = deque()
+        self._received_total_bytes = 0
         self._network_lock = threading.Lock()
 
     def start_stream_listener(self) -> None:
@@ -270,6 +272,7 @@ class RemoteH264Receiver:
     def state(self) -> dict[str, object]:
         state = self._store.state()
         state["received_kib_per_s"] = self.received_kib_per_s()
+        state["received_total_kib"] = self.received_total_kib()
         return state
 
     def latest_jpeg(self) -> bytes | None:
@@ -340,6 +343,7 @@ class RemoteH264Receiver:
     def mark_received_bytes(self, byte_count: int) -> None:
         now = perf_counter()
         with self._network_lock:
+            self._received_total_bytes += byte_count
             self._network_times.append((now, byte_count))
             while self._network_times and now - self._network_times[0][0] > 1.0:
                 self._network_times.popleft()
@@ -350,6 +354,10 @@ class RemoteH264Receiver:
             while self._network_times and now - self._network_times[0][0] > 1.0:
                 self._network_times.popleft()
             return sum(byte_count for _timestamp, byte_count in self._network_times) / 1024
+
+    def received_total_kib(self) -> float:
+        with self._network_lock:
+            return self._received_total_bytes / 1024
 
 
 class _ReceiverDashboardServer(ThreadingHTTPServer):
@@ -365,11 +373,12 @@ class _ReceiverDashboardHandler(BaseHTTPRequestHandler):
     server: _ReceiverDashboardServer
 
     def do_GET(self) -> None:
-        if self.path == "/":
+        path = urlparse(self.path).path
+        if path == "/":
             self._send_bytes(_dashboard_html(), "text/html; charset=utf-8")
-        elif self.path == "/state":
+        elif path == "/state":
             self._send_json(self.server.receiver.state())
-        elif self.path == "/latest.jpg":
+        elif path == "/latest.jpg":
             jpeg = self.server.receiver.latest_jpeg()
             if jpeg is None:
                 self.send_error(HTTPStatus.NOT_FOUND, "No frame available yet.")
@@ -672,6 +681,7 @@ def _dashboard_html() -> bytes:
     <section>
       <div class="grid">
         <div class="metric"><span>Received</span><strong id="received">0.0 KiB/s</strong></div>
+        <div class="metric"><span>Received Total</span><strong id="received-total">0.0 KiB</strong></div>
         <div class="metric"><span>Decoded Frames</span><strong id="frames">0</strong></div>
         <div class="metric"><span>Decoded FPS</span><strong id="fps">0.0</strong></div>
         <div class="metric"><span>Processed FPS</span><strong id="processed-fps">0.0</strong></div>
@@ -687,6 +697,7 @@ def _dashboard_html() -> bytes:
       const state = await fetch('/state', { cache: 'no-store' }).then(r => r.json());
       document.querySelector('#status').textContent = state.status + (state.detail ? ' - ' + state.detail : '');
       document.querySelector('#received').textContent = Number(state.received_kib_per_s || 0).toFixed(1) + ' KiB/s';
+      document.querySelector('#received-total').textContent = Number(state.received_total_kib || 0).toFixed(1) + ' KiB';
       document.querySelector('#frames').textContent = state.frame_count || 0;
       document.querySelector('#fps').textContent = Number(state.decode_fps || 0).toFixed(1);
       document.querySelector('#processed-fps').textContent = Number(state.processed_fps || 0).toFixed(1);
