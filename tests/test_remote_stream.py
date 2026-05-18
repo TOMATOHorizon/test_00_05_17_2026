@@ -131,3 +131,16 @@ def test_receiver_dashboard_requests_latest_frame_manually():
     assert "fetch('/latest.jpg?t='" in html
     assert "Processed FPS" in html
     assert "Received" in html
+    assert "Received Total" in html
+
+
+def test_receiver_tracks_total_received_bytes():
+    from window_frame_monitor.remote_stream import RemoteH264Receiver
+
+    receiver = RemoteH264Receiver()
+
+    receiver.mark_received_bytes(1024)
+    receiver.mark_received_bytes(512)
+    state = receiver.state()
+
+    assert state["received_total_kib"] == 1.5
