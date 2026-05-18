@@ -90,6 +90,17 @@ def test_remote_frame_store_throttles_change_detection(tmp_path: Path):
     assert state["change_score"] == 1.0
 
 
+def test_remote_frame_store_reports_processed_change_fps(tmp_path: Path):
+    store = RemoteFrameStore(output_dir=tmp_path, width=16, height=16, change_fps=1_000_000, snapshot_fps=0)
+
+    store.update_frame(bytes([0, 0, 0]) * (16 * 16))
+    store.update_frame(bytes([255, 255, 255]) * (16 * 16))
+    state = store.state()
+
+    assert state["processed_frame_count"] == 2
+    assert state["processed_fps"] == 2.0
+
+
 def test_remote_frame_store_can_keep_yuv420p_latest_frame_in_memory(tmp_path: Path):
     store = RemoteFrameStore(output_dir=tmp_path, width=16, height=16, snapshot_fps=0, pixel_format="yuv420p")
     y = bytes([96]) * (16 * 16)
@@ -109,3 +120,14 @@ def test_remote_frame_store_can_keep_yuv420p_latest_frame_in_memory(tmp_path: Pa
 def test_decoded_frame_size_supports_rgb_and_yuv420p():
     assert decoded_frame_size(width=16, height=16, pixel_format="rgb24") == 16 * 16 * 3
     assert decoded_frame_size(width=16, height=16, pixel_format="yuv420p") == 16 * 16 * 3 // 2
+
+
+def test_receiver_dashboard_requests_latest_frame_manually():
+    from window_frame_monitor.remote_stream import _dashboard_html
+
+    html = _dashboard_html().decode("utf-8")
+
+    assert 'id="get-latest"' in html
+    assert "fetch('/latest.jpg?t='" in html
+    assert "Processed FPS" in html
+    assert "Received" in html

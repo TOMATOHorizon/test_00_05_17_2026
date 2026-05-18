@@ -119,10 +119,13 @@ class RemoteFrameStore:
         self._latest_frame: bytes | None = None
         self._lock = threading.Lock()
         self._frame_times: deque[float] = deque()
+        self._processed_times: deque[float] = deque()
         self._state: dict[str, object] = {
             "status": "waiting",
             "frame_count": 0,
             "decode_fps": 0.0,
+            "processed_fps": 0.0,
+            "processed_frame_count": 0,
             "change_score": 0.0,
             "changed_pixels_ratio": 0.0,
             "width": width,
@@ -143,21 +146,30 @@ class RemoteFrameStore:
     def update_frame(self, rgb_bytes: bytes) -> None:
         now = perf_counter()
         changed = self._last_change
+        processed = False
         if self._should_run(self._last_change_at, self._change_interval_s, now):
             changed = self._detect_change(rgb_bytes)
             self._last_change = changed
             self._last_change_at = now
+            processed = True
         with self._lock:
             self._latest_frame = rgb_bytes
             self._frame_times.append(now)
             while self._frame_times and now - self._frame_times[0] > 1.0:
                 self._frame_times.popleft()
+            if processed:
+                self._processed_times.append(now)
+                while self._processed_times and now - self._processed_times[0] > 1.0:
+                    self._processed_times.popleft()
             frame_count = int(self._state["frame_count"]) + 1
+            processed_frame_count = int(self._state["processed_frame_count"]) + (1 if processed else 0)
             self._state.update(
                 {
                     "status": "receiving",
                     "frame_count": frame_count,
                     "decode_fps": float(len(self._frame_times)),
+                    "processed_fps": float(len(self._processed_times)),
+                    "processed_frame_count": processed_frame_count,
                     "change_score": changed.change_score,
                     "changed_pixels_ratio": changed.changed_pixels_ratio,
                     "last_frame_time_ns": perf_counter_ns(),
@@ -236,6 +248,8 @@ class RemoteH264Receiver:
         )
         self._stream_thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._network_times: deque[tuple[float, int]] = deque()
+        self._network_lock = threading.Lock()
 
     def start_stream_listener(self) -> None:
         self._stream_thread = threading.Thread(target=self._listen_for_streams, name="h264-stream-listener", daemon=True)
@@ -254,7 +268,9 @@ class RemoteH264Receiver:
             server.server_close()
 
     def state(self) -> dict[str, object]:
-        return self._store.state()
+        state = self._store.state()
+        state["received_kib_per_s"] = self.received_kib_per_s()
+        return state
 
     def latest_jpeg(self) -> bytes | None:
         return self._store.latest_jpeg()
@@ -303,7 +319,11 @@ class RemoteH264Receiver:
         )
         assert decoder.stdin is not None
         assert decoder.stdout is not None
-        pump_thread = threading.Thread(target=_pump_socket_to_decoder, args=(source, decoder.stdin), daemon=True)
+        pump_thread = threading.Thread(
+            target=_pump_socket_to_decoder,
+            args=(source, decoder.stdin, self.mark_received_bytes),
+            daemon=True,
+        )
         pump_thread.start()
         frame_size = decoded_frame_size(width=settings.width, height=settings.height, pixel_format=self._pixel_format)
         try:
@@ -316,6 +336,20 @@ class RemoteH264Receiver:
             _close_process(decoder)
             pump_thread.join(timeout=1)
             self._store.update_status("disconnected")
+
+    def mark_received_bytes(self, byte_count: int) -> None:
+        now = perf_counter()
+        with self._network_lock:
+            self._network_times.append((now, byte_count))
+            while self._network_times and now - self._network_times[0][0] > 1.0:
+                self._network_times.popleft()
+
+    def received_kib_per_s(self) -> float:
+        now = perf_counter()
+        with self._network_lock:
+            while self._network_times and now - self._network_times[0][0] > 1.0:
+                self._network_times.popleft()
+            return sum(byte_count for _timestamp, byte_count in self._network_times) / 1024
 
 
 class _ReceiverDashboardServer(ThreadingHTTPServer):
@@ -497,13 +531,15 @@ def _select_sender_backend(*, use_test_backend: bool) -> CaptureBackend:
     raise RuntimeError("; ".join(reasons) or "No sender capture backend is available.")
 
 
-def _pump_socket_to_decoder(source: BinaryIO, destination: BinaryIO) -> None:
+def _pump_socket_to_decoder(source: BinaryIO, destination: BinaryIO, on_chunk: object | None = None) -> None:
     try:
         while True:
             read1 = getattr(source, "read1", None)
             chunk = read1(4096) if read1 else source.read(4096)
             if not chunk:
                 break
+            if callable(on_chunk):
+                on_chunk(len(chunk))
             destination.write(chunk)
             destination.flush()
     except OSError:
@@ -621,6 +657,7 @@ def _dashboard_html() -> bytes:
     .metric strong { display: block; margin-top: 4px; font-size: 20px; }
     .preview { display: grid; place-items: center; background: #07090d; min-height: 320px; }
     img { max-width: 100%; max-height: 70vh; object-fit: contain; }
+    button { background: #2f6feb; border: 1px solid #4f8cff; border-radius: 6px; color: white; min-height: 36px; padding: 0 14px; }
     pre { margin: 0; white-space: pre-wrap; color: #c9d3e1; font: 12px/1.45 Consolas, monospace; }
   </style>
 </head>
@@ -629,12 +666,15 @@ def _dashboard_html() -> bytes:
     <header>
       <h1>Remote H.264 Receiver</h1>
       <p id="status">waiting</p>
+      <button id="get-latest" type="button">Get Latest Frame</button>
     </header>
     <section class="preview"><img id="latest" alt="Latest decoded frame" /></section>
     <section>
       <div class="grid">
-        <div class="metric"><span>Frames</span><strong id="frames">0</strong></div>
-        <div class="metric"><span>Decode FPS</span><strong id="fps">0.0</strong></div>
+        <div class="metric"><span>Received</span><strong id="received">0.0 KiB/s</strong></div>
+        <div class="metric"><span>Decoded Frames</span><strong id="frames">0</strong></div>
+        <div class="metric"><span>Decoded FPS</span><strong id="fps">0.0</strong></div>
+        <div class="metric"><span>Processed FPS</span><strong id="processed-fps">0.0</strong></div>
         <div class="metric"><span>Change Score</span><strong id="change">0.000</strong></div>
         <div class="metric"><span>Changed Pixels</span><strong id="changed">0.0%</strong></div>
         <div class="metric"><span>Resolution</span><strong id="resolution">0x0</strong></div>
@@ -646,16 +686,23 @@ def _dashboard_html() -> bytes:
     async function tick() {
       const state = await fetch('/state', { cache: 'no-store' }).then(r => r.json());
       document.querySelector('#status').textContent = state.status + (state.detail ? ' - ' + state.detail : '');
+      document.querySelector('#received').textContent = Number(state.received_kib_per_s || 0).toFixed(1) + ' KiB/s';
       document.querySelector('#frames').textContent = state.frame_count || 0;
       document.querySelector('#fps').textContent = Number(state.decode_fps || 0).toFixed(1);
+      document.querySelector('#processed-fps').textContent = Number(state.processed_fps || 0).toFixed(1);
       document.querySelector('#change').textContent = Number(state.change_score || 0).toFixed(3);
       document.querySelector('#changed').textContent = (Number(state.changed_pixels_ratio || 0) * 100).toFixed(1) + '%';
       document.querySelector('#resolution').textContent = `${state.width || 0}x${state.height || 0}`;
       document.querySelector('#raw').textContent = JSON.stringify(state, null, 2);
-      if ((state.frame_count || 0) > 0) {
-        document.querySelector('#latest').src = '/latest.jpg?t=' + Date.now();
+    }
+    async function getLatestFrame() {
+      const response = await fetch('/latest.jpg?t=' + Date.now(), { cache: 'no-store' });
+      if (response.ok) {
+        const blob = await response.blob();
+        document.querySelector('#latest').src = URL.createObjectURL(blob);
       }
     }
+    document.querySelector('#get-latest').addEventListener('click', getLatestFrame);
     setInterval(tick, 500);
     tick();
   </script>
