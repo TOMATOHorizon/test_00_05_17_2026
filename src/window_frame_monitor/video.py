@@ -68,7 +68,11 @@ def build_ffmpeg_h264_command(settings: H264Settings) -> list[str]:
     return command
 
 
-def build_ffmpeg_h264_decoder_command(settings: H264Settings, decoder: str = "software") -> list[str]:
+def build_ffmpeg_h264_decoder_command(
+    settings: H264Settings,
+    decoder: str = "software",
+    pixel_format: str = "rgb24",
+) -> list[str]:
     command = [
         "ffmpeg",
         "-hide_banner",
@@ -92,9 +96,9 @@ def build_ffmpeg_h264_decoder_command(settings: H264Settings, decoder: str = "so
         "-an",
         "-f",
         "rawvideo",
-        "-pix_fmt",
-        "rgb24",
-        "pipe:1",
+            "-pix_fmt",
+            pixel_format,
+            "pipe:1",
         ]
     )
     return command

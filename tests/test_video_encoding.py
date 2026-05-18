@@ -66,6 +66,16 @@ def test_h264_decoder_command_outputs_raw_rgb_frames():
     assert command[-1] == "pipe:1"
 
 
+def test_h264_decoder_command_can_output_yuv420p_frames():
+    settings = H264Settings(width=640, height=360, fps=24, bitrate_kbps=1200)
+
+    command = build_ffmpeg_h264_decoder_command(settings, pixel_format="yuv420p")
+
+    assert "-pix_fmt" in command
+    assert "yuv420p" in command
+    assert command[-1] == "pipe:1"
+
+
 def test_h264_decoder_command_can_request_cuda_decoder():
     settings = H264Settings(width=640, height=360, fps=24, bitrate_kbps=1200)
 

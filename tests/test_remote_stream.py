@@ -3,6 +3,7 @@ from pathlib import Path
 from window_frame_monitor.remote_stream import (
     FrameChangeDetector,
     RemoteFrameStore,
+    decoded_frame_size,
     make_stream_header,
     parse_stream_header,
 )
@@ -44,6 +45,16 @@ def test_change_detector_reports_change_for_different_frames():
     assert result.changed_pixels_ratio == 1.0
 
 
+def test_change_detector_can_use_luma_plane_without_rgb_conversion():
+    detector = FrameChangeDetector(width=16, height=16)
+
+    detector.update_luma(bytes([0]) * (16 * 16))
+    result = detector.update_luma(bytes([255]) * (16 * 16))
+
+    assert result.change_score > 0.5
+    assert result.changed_pixels_ratio == 1.0
+
+
 def test_remote_frame_store_writes_latest_frame_and_state(tmp_path: Path):
     store = RemoteFrameStore(output_dir=tmp_path, width=16, height=16, snapshot_fps=30)
     frame = bytes([80, 120, 160]) * (16 * 16)
@@ -77,3 +88,24 @@ def test_remote_frame_store_throttles_change_detection(tmp_path: Path):
 
     assert state["frame_count"] == 2
     assert state["change_score"] == 1.0
+
+
+def test_remote_frame_store_can_keep_yuv420p_latest_frame_in_memory(tmp_path: Path):
+    store = RemoteFrameStore(output_dir=tmp_path, width=16, height=16, snapshot_fps=0, pixel_format="yuv420p")
+    y = bytes([96]) * (16 * 16)
+    u = bytes([128]) * (8 * 8)
+    v = bytes([128]) * (8 * 8)
+
+    store.update_frame(y + u + v)
+    jpeg = store.latest_jpeg()
+    state = store.state()
+
+    assert state["pixel_format"] == "yuv420p"
+    assert state["frame_count"] == 1
+    assert jpeg is not None
+    assert not (tmp_path / "latest.jpg").exists()
+
+
+def test_decoded_frame_size_supports_rgb_and_yuv420p():
+    assert decoded_frame_size(width=16, height=16, pixel_format="rgb24") == 16 * 16 * 3
+    assert decoded_frame_size(width=16, height=16, pixel_format="yuv420p") == 16 * 16 * 3 // 2
