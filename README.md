@@ -49,6 +49,12 @@ For a lower-CPU receiver test, reduce background analysis and avoid writing a JP
 py -3.12 -m window_frame_monitor.remote_stream receiver --stream-host 0.0.0.0 --stream-port 8766 --dashboard-host 127.0.0.1 --dashboard-port 8770 --decoder cuda --change-fps 5 --snapshot-fps 0 --state-fps 1
 ```
 
+For the closest "Agent receiver" mode, keep decoded frames as in-memory `yuv420p` and only convert to JPEG/RGB when `/latest.jpg` is requested:
+
+```powershell
+py -3.12 -m window_frame_monitor.remote_stream receiver --stream-host 0.0.0.0 --stream-port 8766 --dashboard-host 127.0.0.1 --dashboard-port 8770 --decoder cuda --frame-format yuv420p --change-fps 5 --snapshot-fps 0 --state-fps 1
+```
+
 `--decoder cuda` asks FFmpeg to use NVIDIA `h264_cuvid` hardware decoding. If the target server's FFmpeg build does not include `h264_cuvid`, use `--decoder software`.
 
 Open the receiver dashboard:

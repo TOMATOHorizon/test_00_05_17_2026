@@ -68,6 +68,10 @@ class FrameChangeDetector:
 
     def update(self, rgb_bytes: bytes) -> FrameChange:
         sample = _sample_luma(rgb_bytes, self._width, self._height, self._sample_size)
+        return self.update_luma(sample)
+
+    def update_luma(self, luma_bytes: bytes) -> FrameChange:
+        sample = _resize_luma(luma_bytes, self._width, self._height, self._sample_size)
         if self._previous is None:
             self._previous = sample
             return FrameChange(change_score=1.0, changed_pixels_ratio=1.0)
@@ -97,11 +101,13 @@ class RemoteFrameStore:
         change_fps: float = 10.0,
         snapshot_fps: float = 1.0,
         state_fps: float = 2.0,
+        pixel_format: str = "rgb24",
     ) -> None:
         self._output_dir = Path(output_dir)
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._width = width
         self._height = height
+        self._pixel_format = pixel_format
         self._detector = FrameChangeDetector(width=width, height=height)
         self._change_interval_s = _fps_to_interval(change_fps)
         self._snapshot_interval_s = _fps_to_interval(snapshot_fps)
@@ -110,7 +116,7 @@ class RemoteFrameStore:
         self._last_snapshot_at = 0.0
         self._last_state_at = 0.0
         self._last_change = FrameChange(change_score=0.0, changed_pixels_ratio=0.0)
-        self._latest_rgb: bytes | None = None
+        self._latest_frame: bytes | None = None
         self._lock = threading.Lock()
         self._frame_times: deque[float] = deque()
         self._state: dict[str, object] = {
@@ -121,6 +127,7 @@ class RemoteFrameStore:
             "changed_pixels_ratio": 0.0,
             "width": width,
             "height": height,
+            "pixel_format": pixel_format,
             "latest_frame_path": str(self._output_dir / "latest.jpg"),
             "state_path": str(self._output_dir / "state.json"),
         }
@@ -137,11 +144,11 @@ class RemoteFrameStore:
         now = perf_counter()
         changed = self._last_change
         if self._should_run(self._last_change_at, self._change_interval_s, now):
-            changed = self._detector.update(rgb_bytes)
+            changed = self._detect_change(rgb_bytes)
             self._last_change = changed
             self._last_change_at = now
         with self._lock:
-            self._latest_rgb = rgb_bytes
+            self._latest_frame = rgb_bytes
             self._frame_times.append(now)
             while self._frame_times and now - self._frame_times[0] > 1.0:
                 self._frame_times.popleft()
@@ -157,7 +164,7 @@ class RemoteFrameStore:
                 }
             )
             if self._should_run(self._last_snapshot_at, self._snapshot_interval_s, now):
-                _write_jpeg(self._output_dir / "latest.jpg", rgb_bytes, self._width, self._height)
+                _write_jpeg(self._output_dir / "latest.jpg", self._to_rgb(rgb_bytes), self._width, self._height)
                 self._last_snapshot_at = now
             if self._should_run(self._last_state_at, self._state_interval_s, now):
                 self._write_state_locked()
@@ -169,11 +176,21 @@ class RemoteFrameStore:
 
     def latest_jpeg(self) -> bytes | None:
         with self._lock:
-            rgb = self._latest_rgb
-        if rgb is not None:
-            return _encode_jpeg(rgb, self._width, self._height)
+            frame = self._latest_frame
+        if frame is not None:
+            return _encode_jpeg(self._to_rgb(frame), self._width, self._height)
         path = self._output_dir / "latest.jpg"
         return path.read_bytes() if path.exists() else None
+
+    def _detect_change(self, frame_bytes: bytes) -> FrameChange:
+        if self._pixel_format == "yuv420p":
+            return self._detector.update_luma(frame_bytes[: self._width * self._height])
+        return self._detector.update(frame_bytes)
+
+    def _to_rgb(self, frame_bytes: bytes) -> bytes:
+        if self._pixel_format == "yuv420p":
+            return _yuv420p_to_rgb(frame_bytes, self._width, self._height)
+        return frame_bytes
 
     def _write_state_locked(self) -> None:
         (self._output_dir / "state.json").write_text(json.dumps(self._state, indent=2), encoding="utf-8")
@@ -196,6 +213,7 @@ class RemoteH264Receiver:
         change_fps: float = 10.0,
         snapshot_fps: float = 1.0,
         state_fps: float = 2.0,
+        pixel_format: str = "yuv420p",
     ) -> None:
         self.stream_host = stream_host
         self.stream_port = stream_port
@@ -206,6 +224,7 @@ class RemoteH264Receiver:
         self._change_fps = change_fps
         self._snapshot_fps = snapshot_fps
         self._state_fps = state_fps
+        self._pixel_format = pixel_format
         self._store = RemoteFrameStore(
             output_dir=self.output_dir,
             width=16,
@@ -213,6 +232,7 @@ class RemoteH264Receiver:
             change_fps=change_fps,
             snapshot_fps=snapshot_fps,
             state_fps=state_fps,
+            pixel_format=pixel_format,
         )
         self._stream_thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -272,10 +292,11 @@ class RemoteH264Receiver:
             change_fps=self._change_fps,
             snapshot_fps=self._snapshot_fps,
             state_fps=self._state_fps,
+            pixel_format=self._pixel_format,
         )
         self._store.update_status("connected", f"{address[0]}:{address[1]}")
         decoder = subprocess.Popen(
-            build_ffmpeg_h264_decoder_command(settings, decoder=self._decoder),
+            build_ffmpeg_h264_decoder_command(settings, decoder=self._decoder, pixel_format=self._pixel_format),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -284,7 +305,7 @@ class RemoteH264Receiver:
         assert decoder.stdout is not None
         pump_thread = threading.Thread(target=_pump_socket_to_decoder, args=(source, decoder.stdin), daemon=True)
         pump_thread.start()
-        frame_size = settings.width * settings.height * 3
+        frame_size = decoded_frame_size(width=settings.width, height=settings.height, pixel_format=self._pixel_format)
         try:
             while not self._stop.is_set():
                 raw = _read_exact(decoder.stdout, frame_size)
@@ -400,6 +421,7 @@ def main() -> None:
     receiver.add_argument("--change-fps", type=float, default=10.0)
     receiver.add_argument("--snapshot-fps", type=float, default=1.0)
     receiver.add_argument("--state-fps", type=float, default=2.0)
+    receiver.add_argument("--frame-format", default="yuv420p", choices=["yuv420p", "rgb24"])
 
     sender = subparsers.add_parser("sender", help="Capture a window and push H.264 to a receiver.")
     sender.add_argument("--server-host", required=True)
@@ -430,6 +452,7 @@ def main() -> None:
             change_fps=args.change_fps,
             snapshot_fps=args.snapshot_fps,
             state_fps=args.state_fps,
+            pixel_format=args.frame_format,
         )
         app.start_stream_listener()
         app.serve_dashboard()
@@ -527,6 +550,24 @@ def _sample_luma(rgb_bytes: bytes, width: int, height: int, sample_size: tuple[i
     return image.tobytes()
 
 
+def _resize_luma(luma_bytes: bytes, width: int, height: int, sample_size: tuple[int, int]) -> bytes:
+    image = Image.frombytes("L", (width, height), luma_bytes)
+    return image.resize(sample_size, Image.Resampling.BILINEAR).tobytes()
+
+
+def _yuv420p_to_rgb(yuv_bytes: bytes, width: int, height: int) -> bytes:
+    y_size = width * height
+    uv_width = width // 2
+    uv_height = height // 2
+    uv_size = uv_width * uv_height
+    y = Image.frombytes("L", (width, height), yuv_bytes[:y_size])
+    u = Image.frombytes("L", (uv_width, uv_height), yuv_bytes[y_size : y_size + uv_size])
+    v = Image.frombytes("L", (uv_width, uv_height), yuv_bytes[y_size + uv_size : y_size + uv_size * 2])
+    u = u.resize((width, height), Image.Resampling.BILINEAR)
+    v = v.resize((width, height), Image.Resampling.BILINEAR)
+    return Image.merge("YCbCr", (y, u, v)).convert("RGB").tobytes()
+
+
 def _write_jpeg(path: Path, rgb_bytes: bytes, width: int, height: int) -> None:
     path.write_bytes(_encode_jpeg(rgb_bytes, width, height))
 
@@ -540,6 +581,14 @@ def _encode_jpeg(rgb_bytes: bytes, width: int, height: int) -> bytes:
 
 def _fps_to_interval(fps: float) -> float | None:
     return None if fps <= 0 else 1 / fps
+
+
+def decoded_frame_size(*, width: int, height: int, pixel_format: str) -> int:
+    if pixel_format == "yuv420p":
+        return width * height * 3 // 2
+    if pixel_format == "rgb24":
+        return width * height * 3
+    raise ValueError(f"Unsupported decoded pixel format: {pixel_format}")
 
 
 def _close_process(process: subprocess.Popen[bytes]) -> None:
