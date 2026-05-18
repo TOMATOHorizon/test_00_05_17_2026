@@ -68,8 +68,8 @@ def build_ffmpeg_h264_command(settings: H264Settings) -> list[str]:
     return command
 
 
-def build_ffmpeg_h264_decoder_command(settings: H264Settings) -> list[str]:
-    return [
+def build_ffmpeg_h264_decoder_command(settings: H264Settings, decoder: str = "software") -> list[str]:
+    command = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel",
@@ -82,6 +82,11 @@ def build_ffmpeg_h264_decoder_command(settings: H264Settings) -> list[str]:
         "0",
         "-f",
         "h264",
+    ]
+    if decoder == "cuda":
+        command.extend(["-c:v", "h264_cuvid"])
+    command.extend(
+        [
         "-i",
         "pipe:0",
         "-an",
@@ -90,7 +95,9 @@ def build_ffmpeg_h264_decoder_command(settings: H264Settings) -> list[str]:
         "-pix_fmt",
         "rgb24",
         "pipe:1",
-    ]
+        ]
+    )
+    return command
 
 
 def h264_probe_output_dir(base_dir: str | Path = ".") -> Path:

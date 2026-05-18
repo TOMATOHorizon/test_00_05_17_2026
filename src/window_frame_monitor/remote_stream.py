@@ -88,12 +88,29 @@ class FrameChangeDetector:
 
 
 class RemoteFrameStore:
-    def __init__(self, *, output_dir: str | Path, width: int, height: int) -> None:
+    def __init__(
+        self,
+        *,
+        output_dir: str | Path,
+        width: int,
+        height: int,
+        change_fps: float = 10.0,
+        snapshot_fps: float = 1.0,
+        state_fps: float = 2.0,
+    ) -> None:
         self._output_dir = Path(output_dir)
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._width = width
         self._height = height
         self._detector = FrameChangeDetector(width=width, height=height)
+        self._change_interval_s = _fps_to_interval(change_fps)
+        self._snapshot_interval_s = _fps_to_interval(snapshot_fps)
+        self._state_interval_s = _fps_to_interval(state_fps)
+        self._last_change_at = 0.0
+        self._last_snapshot_at = 0.0
+        self._last_state_at = 0.0
+        self._last_change = FrameChange(change_score=0.0, changed_pixels_ratio=0.0)
+        self._latest_rgb: bytes | None = None
         self._lock = threading.Lock()
         self._frame_times: deque[float] = deque()
         self._state: dict[str, object] = {
@@ -117,9 +134,14 @@ class RemoteFrameStore:
             self._write_state_locked()
 
     def update_frame(self, rgb_bytes: bytes) -> None:
-        changed = self._detector.update(rgb_bytes)
         now = perf_counter()
+        changed = self._last_change
+        if self._should_run(self._last_change_at, self._change_interval_s, now):
+            changed = self._detector.update(rgb_bytes)
+            self._last_change = changed
+            self._last_change_at = now
         with self._lock:
+            self._latest_rgb = rgb_bytes
             self._frame_times.append(now)
             while self._frame_times and now - self._frame_times[0] > 1.0:
                 self._frame_times.popleft()
@@ -134,21 +156,31 @@ class RemoteFrameStore:
                     "last_frame_time_ns": perf_counter_ns(),
                 }
             )
-            _write_jpeg(self._output_dir / "latest.jpg", rgb_bytes, self._width, self._height)
-            self._write_state_locked()
+            if self._should_run(self._last_snapshot_at, self._snapshot_interval_s, now):
+                _write_jpeg(self._output_dir / "latest.jpg", rgb_bytes, self._width, self._height)
+                self._last_snapshot_at = now
+            if self._should_run(self._last_state_at, self._state_interval_s, now):
+                self._write_state_locked()
+                self._last_state_at = now
 
     def state(self) -> dict[str, object]:
         with self._lock:
             return dict(self._state)
 
     def latest_jpeg(self) -> bytes | None:
+        with self._lock:
+            rgb = self._latest_rgb
+        if rgb is not None:
+            return _encode_jpeg(rgb, self._width, self._height)
         path = self._output_dir / "latest.jpg"
-        if not path.exists():
-            return None
-        return path.read_bytes()
+        return path.read_bytes() if path.exists() else None
 
     def _write_state_locked(self) -> None:
         (self._output_dir / "state.json").write_text(json.dumps(self._state, indent=2), encoding="utf-8")
+
+    @staticmethod
+    def _should_run(last_run_at: float, interval_s: float | None, now: float) -> bool:
+        return interval_s is not None and (last_run_at == 0.0 or now - last_run_at >= interval_s)
 
 
 class RemoteH264Receiver:
@@ -160,13 +192,28 @@ class RemoteH264Receiver:
         dashboard_host: str = "127.0.0.1",
         dashboard_port: int = 8770,
         output_dir: str | Path = "runtime/remote_receiver",
+        decoder: str = "software",
+        change_fps: float = 10.0,
+        snapshot_fps: float = 1.0,
+        state_fps: float = 2.0,
     ) -> None:
         self.stream_host = stream_host
         self.stream_port = stream_port
         self.dashboard_host = dashboard_host
         self.dashboard_port = dashboard_port
         self.output_dir = Path(output_dir)
-        self._store = RemoteFrameStore(output_dir=self.output_dir, width=16, height=16)
+        self._decoder = decoder
+        self._change_fps = change_fps
+        self._snapshot_fps = snapshot_fps
+        self._state_fps = state_fps
+        self._store = RemoteFrameStore(
+            output_dir=self.output_dir,
+            width=16,
+            height=16,
+            change_fps=change_fps,
+            snapshot_fps=snapshot_fps,
+            state_fps=state_fps,
+        )
         self._stream_thread: threading.Thread | None = None
         self._stop = threading.Event()
 
@@ -218,10 +265,17 @@ class RemoteH264Receiver:
             self._store.update_status("header-error", str(exc))
             return
 
-        self._store = RemoteFrameStore(output_dir=self.output_dir, width=settings.width, height=settings.height)
+        self._store = RemoteFrameStore(
+            output_dir=self.output_dir,
+            width=settings.width,
+            height=settings.height,
+            change_fps=self._change_fps,
+            snapshot_fps=self._snapshot_fps,
+            state_fps=self._state_fps,
+        )
         self._store.update_status("connected", f"{address[0]}:{address[1]}")
         decoder = subprocess.Popen(
-            build_ffmpeg_h264_decoder_command(settings),
+            build_ffmpeg_h264_decoder_command(settings, decoder=self._decoder),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -342,6 +396,10 @@ def main() -> None:
     receiver.add_argument("--dashboard-host", default="127.0.0.1")
     receiver.add_argument("--dashboard-port", type=int, default=8770)
     receiver.add_argument("--output-dir", default="runtime/remote_receiver")
+    receiver.add_argument("--decoder", default="software", choices=["software", "cuda"])
+    receiver.add_argument("--change-fps", type=float, default=10.0)
+    receiver.add_argument("--snapshot-fps", type=float, default=1.0)
+    receiver.add_argument("--state-fps", type=float, default=2.0)
 
     sender = subparsers.add_parser("sender", help="Capture a window and push H.264 to a receiver.")
     sender.add_argument("--server-host", required=True)
@@ -368,6 +426,10 @@ def main() -> None:
             dashboard_host=args.dashboard_host,
             dashboard_port=args.dashboard_port,
             output_dir=args.output_dir,
+            decoder=args.decoder,
+            change_fps=args.change_fps,
+            snapshot_fps=args.snapshot_fps,
+            state_fps=args.state_fps,
         )
         app.start_stream_listener()
         app.serve_dashboard()
@@ -466,10 +528,18 @@ def _sample_luma(rgb_bytes: bytes, width: int, height: int, sample_size: tuple[i
 
 
 def _write_jpeg(path: Path, rgb_bytes: bytes, width: int, height: int) -> None:
+    path.write_bytes(_encode_jpeg(rgb_bytes, width, height))
+
+
+def _encode_jpeg(rgb_bytes: bytes, width: int, height: int) -> bytes:
     image = Image.frombytes("RGB", (width, height), rgb_bytes)
     buffer = BytesIO()
     image.save(buffer, format="JPEG", quality=88)
-    path.write_bytes(buffer.getvalue())
+    return buffer.getvalue()
+
+
+def _fps_to_interval(fps: float) -> float | None:
+    return None if fps <= 0 else 1 / fps
 
 
 def _close_process(process: subprocess.Popen[bytes]) -> None:

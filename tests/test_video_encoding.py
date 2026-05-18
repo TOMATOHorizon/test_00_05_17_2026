@@ -66,6 +66,15 @@ def test_h264_decoder_command_outputs_raw_rgb_frames():
     assert command[-1] == "pipe:1"
 
 
+def test_h264_decoder_command_can_request_cuda_decoder():
+    settings = H264Settings(width=640, height=360, fps=24, bitrate_kbps=1200)
+
+    command = build_ffmpeg_h264_decoder_command(settings, decoder="cuda")
+
+    assert "-c:v" in command
+    assert "h264_cuvid" in command
+
+
 def test_h264_probe_output_dir_is_separate_runtime_folder(tmp_path):
     output_dir = h264_probe_output_dir(tmp_path)
 
