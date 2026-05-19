@@ -442,10 +442,18 @@ def run_sender(
         build_ffmpeg_h264_command(settings),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
     )
     assert encoder_process.stdin is not None
     assert encoder_process.stdout is not None
+    assert encoder_process.stderr is not None
+    encoder_errors: deque[str] = deque(maxlen=8)
+    stderr_thread = threading.Thread(
+        target=_collect_process_stderr,
+        args=(encoder_process.stderr, encoder_errors),
+        daemon=True,
+    )
+    stderr_thread.start()
     backend.start(target)
     sent_frames = 0
     print(
@@ -463,16 +471,31 @@ def run_sender(
                 loop_started = perf_counter()
                 frame = backend.get_frame()
                 rgb_bytes = _resize_rgb(frame, settings.width, settings.height)
-                encoder_process.stdin.write(rgb_bytes)
-                encoder_process.stdin.flush()
+                try:
+                    encoder_process.stdin.write(rgb_bytes)
+                    encoder_process.stdin.flush()
+                except BrokenPipeError:
+                    error_detail = _join_recent_errors(encoder_errors)
+                    if error_detail:
+                        print(f"Encoder stopped accepting frames: {error_detail}")
+                    else:
+                        print("Encoder stopped accepting frames.")
+                    break
                 sent_frames += 1
                 elapsed = perf_counter() - loop_started
                 sleep(max(0.0, interval_s - elapsed))
         finally:
             backend.stop()
-            encoder_process.stdin.close()
+            try:
+                encoder_process.stdin.close()
+            except OSError:
+                pass
             pump_thread.join(timeout=3)
             _close_process(encoder_process)
+            stderr_thread.join(timeout=1)
+            error_detail = _join_recent_errors(encoder_errors)
+            if error_detail:
+                print(f"Encoder detail: {error_detail}")
             print(f"Sender stopped after {sent_frames} frames.")
 
 
