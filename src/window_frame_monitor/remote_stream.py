@@ -342,12 +342,14 @@ class RemoteH264Receiver:
             while not self._stop.is_set():
                 raw = _read_exact(decoder.stdout, frame_size)
                 if raw is None:
-                    returncode = decoder.poll()
+                    returncode = _wait_process_returncode(decoder, timeout_s=0.5)
+                    stderr_detail = _join_recent_errors(decoder_errors)
                     if returncode is not None and returncode != 0:
                         disconnect_detail = f"decoder exited with code {returncode}"
-                        stderr_detail = _join_recent_errors(decoder_errors)
                         if stderr_detail:
                             disconnect_detail = f"{disconnect_detail}: {stderr_detail}"
+                    elif stderr_detail:
+                        disconnect_detail = f"decoder ended: {stderr_detail}"
                     break
                 self._store.update_frame(raw)
         except Exception as exc:
@@ -618,6 +620,13 @@ def _collect_process_stderr(source: BinaryIO, messages: deque[str]) -> None:
 
 def _join_recent_errors(messages: deque[str]) -> str:
     return " | ".join(messages)
+
+
+def _wait_process_returncode(process: subprocess.Popen[bytes], timeout_s: float) -> int | None:
+    try:
+        return process.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return process.poll()
 
 
 def _pump_encoder_to_socket(source: BinaryIO, connection: socket.socket) -> None:
