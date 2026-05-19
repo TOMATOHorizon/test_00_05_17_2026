@@ -318,10 +318,18 @@ class RemoteH264Receiver:
             build_ffmpeg_h264_decoder_command(settings, decoder=self._decoder, pixel_format=self._pixel_format),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
         assert decoder.stdin is not None
         assert decoder.stdout is not None
+        assert decoder.stderr is not None
+        decoder_errors: deque[str] = deque(maxlen=6)
+        stderr_thread = threading.Thread(
+            target=_collect_process_stderr,
+            args=(decoder.stderr, decoder_errors),
+            daemon=True,
+        )
+        stderr_thread.start()
         pump_thread = threading.Thread(
             target=_pump_socket_to_decoder,
             args=(source, decoder.stdin, self.mark_received_bytes),
@@ -337,6 +345,9 @@ class RemoteH264Receiver:
                     returncode = decoder.poll()
                     if returncode is not None and returncode != 0:
                         disconnect_detail = f"decoder exited with code {returncode}"
+                        stderr_detail = _join_recent_errors(decoder_errors)
+                        if stderr_detail:
+                            disconnect_detail = f"{disconnect_detail}: {stderr_detail}"
                     break
                 self._store.update_frame(raw)
         except Exception as exc:
@@ -345,6 +356,7 @@ class RemoteH264Receiver:
         finally:
             _close_process(decoder)
             pump_thread.join(timeout=1)
+            stderr_thread.join(timeout=1)
             self._store.update_status("disconnected", disconnect_detail)
 
     def mark_received_bytes(self, byte_count: int) -> None:
@@ -572,6 +584,17 @@ def _pump_socket_to_decoder(source: BinaryIO, destination: BinaryIO, on_chunk: o
             destination.close()
         except OSError:
             pass
+
+
+def _collect_process_stderr(source: BinaryIO, messages: deque[str]) -> None:
+    for raw_line in iter(source.readline, b""):
+        line = raw_line.decode("utf-8", errors="replace").strip()
+        if line:
+            messages.append(line)
+
+
+def _join_recent_errors(messages: deque[str]) -> str:
+    return " | ".join(messages)
 
 
 def _pump_encoder_to_socket(source: BinaryIO, connection: socket.socket) -> None:
