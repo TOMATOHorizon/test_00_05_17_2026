@@ -329,16 +329,23 @@ class RemoteH264Receiver:
         )
         pump_thread.start()
         frame_size = decoded_frame_size(width=settings.width, height=settings.height, pixel_format=self._pixel_format)
+        disconnect_detail = "stream ended"
         try:
             while not self._stop.is_set():
                 raw = _read_exact(decoder.stdout, frame_size)
                 if raw is None:
+                    returncode = decoder.poll()
+                    if returncode is not None and returncode != 0:
+                        disconnect_detail = f"decoder exited with code {returncode}"
                     break
                 self._store.update_frame(raw)
+        except Exception as exc:
+            disconnect_detail = str(exc)
+            raise
         finally:
             _close_process(decoder)
             pump_thread.join(timeout=1)
-            self._store.update_status("disconnected")
+            self._store.update_status("disconnected", disconnect_detail)
 
     def mark_received_bytes(self, byte_count: int) -> None:
         now = perf_counter()
@@ -428,6 +435,11 @@ def run_sender(
     assert encoder_process.stdin is not None
     assert encoder_process.stdout is not None
     backend.start(target)
+    sent_frames = 0
+    print(
+        f"Sending H.264 stream to {server_host}:{stream_port} "
+        f"at {settings.width}x{settings.height} {settings.fps}fps using {settings.encoder}."
+    )
     with socket.create_connection((server_host, stream_port), timeout=10) as connection:
         connection.sendall(make_stream_header(settings))
         pump_thread = threading.Thread(target=_pump_encoder_to_socket, args=(encoder_process.stdout, connection), daemon=True)
@@ -441,6 +453,7 @@ def run_sender(
                 rgb_bytes = _resize_rgb(frame, settings.width, settings.height)
                 encoder_process.stdin.write(rgb_bytes)
                 encoder_process.stdin.flush()
+                sent_frames += 1
                 elapsed = perf_counter() - loop_started
                 sleep(max(0.0, interval_s - elapsed))
         finally:
@@ -448,6 +461,7 @@ def run_sender(
             encoder_process.stdin.close()
             pump_thread.join(timeout=3)
             _close_process(encoder_process)
+            print(f"Sender stopped after {sent_frames} frames.")
 
 
 def main() -> None:
