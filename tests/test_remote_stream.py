@@ -144,3 +144,13 @@ def test_receiver_tracks_total_received_bytes():
     state = receiver.state()
 
     assert state["received_total_kib"] == 1.5
+
+
+def test_remote_frame_store_keeps_disconnect_detail(tmp_path: Path):
+    store = RemoteFrameStore(output_dir=tmp_path, width=16, height=16)
+
+    store.update_status("disconnected", "stream ended")
+    state = store.state()
+
+    assert state["status"] == "disconnected"
+    assert state["detail"] == "stream ended"
