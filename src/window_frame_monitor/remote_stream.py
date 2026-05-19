@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import socket
 import subprocess
 import threading
+import urllib.error
+import urllib.request
 from collections import deque
 from dataclasses import asdict, dataclass
 from http import HTTPStatus
@@ -27,6 +30,12 @@ from window_frame_monitor.windows import list_windows, resolve_window
 
 
 STREAM_MAGIC = "WFH264/1"
+DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
+DEFAULT_VLM_MODEL = "qwen3-vl:8b-instruct"
+DEFAULT_VLM_SYSTEM_PROMPT = (
+    "您好，可以请您扮演一份视觉描述者或者说是视觉描述官，"
+    "简洁描述画面中的事物以及关键内容吗？可以尝试借助上下文进行联系、想象、推理。 Thank you."
+)
 
 
 @dataclass(frozen=True)
@@ -227,6 +236,11 @@ class RemoteH264Receiver:
         snapshot_fps: float = 1.0,
         state_fps: float = 2.0,
         pixel_format: str = "yuv420p",
+        ollama_url: str = DEFAULT_OLLAMA_URL,
+        vlm_model: str = DEFAULT_VLM_MODEL,
+        vlm_context_tokens: int = 40_000,
+        vlm_max_output_tokens: int = 50,
+        vlm_system_prompt: str = DEFAULT_VLM_SYSTEM_PROMPT,
     ) -> None:
         self.stream_host = stream_host
         self.stream_port = stream_port
@@ -238,6 +252,14 @@ class RemoteH264Receiver:
         self._snapshot_fps = snapshot_fps
         self._state_fps = state_fps
         self._pixel_format = pixel_format
+        self._ollama_url = ollama_url.rstrip("/")
+        self._vlm_model = vlm_model
+        self._vlm_context_tokens = max(1024, int(vlm_context_tokens))
+        self._vlm_max_output_tokens = max(1, int(vlm_max_output_tokens))
+        self._vlm_system_prompt = vlm_system_prompt
+        self._vlm_lock = threading.Lock()
+        self._vlm_messages: list[dict[str, object]] = []
+        self._vlm_history: deque[dict[str, object]] = deque(maxlen=80)
         self._store = RemoteFrameStore(
             output_dir=self.output_dir,
             width=16,
@@ -277,6 +299,85 @@ class RemoteH264Receiver:
 
     def latest_jpeg(self) -> bytes | None:
         return self._store.latest_jpeg()
+
+    def describe_latest_frame(self) -> dict[str, object]:
+        jpeg = self.latest_jpeg()
+        if jpeg is None:
+            return self._record_vlm_history("error", "No frame available yet.")
+        started = perf_counter()
+        try:
+            description = self._call_ollama_vlm(jpeg)
+        except Exception as exc:
+            return self._record_vlm_history("error", str(exc))
+        elapsed_ms = (perf_counter() - started) * 1000
+        return self._record_vlm_history("ok", description, elapsed_ms=elapsed_ms)
+
+    def vlm_history(self) -> list[dict[str, object]]:
+        with self._vlm_lock:
+            return list(self._vlm_history)
+
+    def _call_ollama_vlm(self, jpeg: bytes) -> str:
+        user_content = "请简洁描述当前画面中的事物与关键内容。"
+        image_b64 = base64.b64encode(jpeg).decode("ascii")
+        with self._vlm_lock:
+            messages = [
+                {"role": "system", "content": self._vlm_system_prompt},
+                *self._vlm_messages,
+                {"role": "user", "content": user_content, "images": [image_b64]},
+            ]
+        payload = {
+            "model": self._vlm_model,
+            "messages": messages,
+            "stream": False,
+            "options": {
+                "num_ctx": self._vlm_context_tokens,
+                "num_predict": self._vlm_max_output_tokens,
+            },
+        }
+        request = urllib.request.Request(
+            f"{self._ollama_url}/api/chat",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Ollama HTTP {exc.code}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Ollama request failed: {exc.reason}") from exc
+        content = str(body.get("message", {}).get("content", "")).strip()
+        if not content:
+            raise RuntimeError("Ollama returned an empty description.")
+        with self._vlm_lock:
+            self._vlm_messages.append({"role": "user", "content": user_content})
+            self._vlm_messages.append({"role": "assistant", "content": content})
+            self._trim_vlm_messages_locked()
+        return content
+
+    def _record_vlm_history(
+        self,
+        status: str,
+        content: str,
+        *,
+        elapsed_ms: float | None = None,
+    ) -> dict[str, object]:
+        event: dict[str, object] = {
+            "status": status,
+            "content": content,
+            "elapsed_ms": elapsed_ms,
+            "time_ns": perf_counter_ns(),
+        }
+        with self._vlm_lock:
+            self._vlm_history.append(event)
+        return event
+
+    def _trim_vlm_messages_locked(self) -> None:
+        max_chars = self._vlm_context_tokens * 4
+        while len(json.dumps(self._vlm_messages, ensure_ascii=False)) > max_chars and len(self._vlm_messages) > 2:
+            del self._vlm_messages[:2]
 
     def _listen_for_streams(self) -> None:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
@@ -399,12 +500,21 @@ class _ReceiverDashboardHandler(BaseHTTPRequestHandler):
             self._send_bytes(_dashboard_html(), "text/html; charset=utf-8")
         elif path == "/state":
             self._send_json(self.server.receiver.state())
+        elif path == "/vlm-history":
+            self._send_json(self.server.receiver.vlm_history())
         elif path == "/latest.jpg":
             jpeg = self.server.receiver.latest_jpeg()
             if jpeg is None:
                 self.send_error(HTTPStatus.NOT_FOUND, "No frame available yet.")
                 return
             self._send_bytes(jpeg, "image/jpeg")
+        else:
+            self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+
+    def do_POST(self) -> None:
+        path = urlparse(self.path).path
+        if path == "/describe-latest":
+            self._send_json(self.server.receiver.describe_latest_frame())
         else:
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
@@ -516,6 +626,11 @@ def main() -> None:
     receiver.add_argument("--snapshot-fps", type=float, default=1.0)
     receiver.add_argument("--state-fps", type=float, default=2.0)
     receiver.add_argument("--frame-format", default="yuv420p", choices=["yuv420p", "rgb24"])
+    receiver.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL)
+    receiver.add_argument("--vlm-model", default=DEFAULT_VLM_MODEL)
+    receiver.add_argument("--vlm-context-tokens", type=int, default=40_000)
+    receiver.add_argument("--vlm-max-output-tokens", type=int, default=50)
+    receiver.add_argument("--vlm-system-prompt", default=DEFAULT_VLM_SYSTEM_PROMPT)
 
     sender = subparsers.add_parser("sender", help="Capture a window and push H.264 to a receiver.")
     sender.add_argument("--server-host", required=True)
@@ -547,6 +662,11 @@ def main() -> None:
             snapshot_fps=args.snapshot_fps,
             state_fps=args.state_fps,
             pixel_format=args.frame_format,
+            ollama_url=args.ollama_url,
+            vlm_model=args.vlm_model,
+            vlm_context_tokens=args.vlm_context_tokens,
+            vlm_max_output_tokens=args.vlm_max_output_tokens,
+            vlm_system_prompt=args.vlm_system_prompt,
         )
         app.start_stream_listener()
         app.serve_dashboard()
@@ -717,7 +837,7 @@ def _close_process(process: subprocess.Popen[bytes]) -> None:
 
 
 def _dashboard_html() -> bytes:
-    return b"""<!doctype html>
+    return """<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
@@ -726,17 +846,28 @@ def _dashboard_html() -> bytes:
   <style>
     :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #101216; color: #f5f7fb; }
     body { margin: 0; }
-    main { min-height: 100vh; display: grid; grid-template-rows: auto 1fr auto; }
+    main { min-height: 100vh; display: grid; grid-template-rows: auto 1fr auto auto; }
     header, section { padding: 16px 18px; border-bottom: 1px solid #29313d; }
     h1 { margin: 0; font-size: 20px; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
     .metric { border: 1px solid #29313d; border-radius: 6px; padding: 12px; background: #0b0e13; }
     .metric span { display: block; color: #aeb7c6; font-size: 12px; }
     .metric strong { display: block; margin-top: 4px; font-size: 20px; }
-    .preview { display: grid; place-items: center; background: #07090d; min-height: 320px; }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; }
+    .content { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 14px; align-items: stretch; }
+    .preview { display: grid; place-items: center; background: #07090d; min-height: 320px; border: 1px solid #29313d; border-radius: 6px; }
+    .llm-panel { border: 1px solid #29313d; border-radius: 6px; background: #0b0e13; padding: 12px; min-height: 320px; display: grid; grid-template-rows: auto 1fr; gap: 10px; }
+    .llm-panel h2 { margin: 0; font-size: 14px; color: #dce6f5; }
+    .llm-history { height: 300px; overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: #c9d3e1; font: 12px/1.45 Consolas, monospace; }
+    .llm-entry { border-top: 1px solid #202734; padding: 10px 0; }
+    .llm-entry:first-child { border-top: 0; padding-top: 0; }
+    .llm-meta { color: #8ea0b8; font-size: 11px; margin-bottom: 4px; }
+    .llm-error { color: #ffb4a8; }
     img { max-width: 100%; max-height: 70vh; object-fit: contain; }
     button { background: #2f6feb; border: 1px solid #4f8cff; border-radius: 6px; color: white; min-height: 36px; padding: 0 14px; }
+    button:disabled { opacity: 0.55; cursor: wait; }
     pre { margin: 0; white-space: pre-wrap; color: #c9d3e1; font: 12px/1.45 Consolas, monospace; }
+    @media (max-width: 900px) { .content { grid-template-columns: 1fr; } .llm-history { height: 220px; } }
   </style>
 </head>
 <body>
@@ -744,9 +875,18 @@ def _dashboard_html() -> bytes:
     <header>
       <h1>Remote H.264 Receiver</h1>
       <p id="status">waiting</p>
-      <button id="get-latest" type="button">Get Latest Frame</button>
+      <div class="actions">
+        <button id="get-latest" type="button">Get Latest Frame</button>
+        <button id="describe-latest" type="button">Send Latest Frame to VLM</button>
+      </div>
     </header>
-    <section class="preview"><img id="latest" alt="Latest decoded frame" /></section>
+    <section class="content">
+      <div class="preview"><img id="latest" alt="Latest decoded frame" /></div>
+      <aside class="llm-panel">
+        <h2>LLM History</h2>
+        <div id="llm-history" class="llm-history"></div>
+      </aside>
+    </section>
     <section>
       <div class="grid">
         <div class="metric"><span>Received</span><strong id="received">0.0 KiB/s</strong></div>
@@ -774,6 +914,7 @@ def _dashboard_html() -> bytes:
       document.querySelector('#changed').textContent = (Number(state.changed_pixels_ratio || 0) * 100).toFixed(1) + '%';
       document.querySelector('#resolution').textContent = `${state.width || 0}x${state.height || 0}`;
       document.querySelector('#raw').textContent = JSON.stringify(state, null, 2);
+      await refreshVlmHistory();
     }
     async function getLatestFrame() {
       const response = await fetch('/latest.jpg?t=' + Date.now(), { cache: 'no-store' });
@@ -782,12 +923,52 @@ def _dashboard_html() -> bytes:
         document.querySelector('#latest').src = URL.createObjectURL(blob);
       }
     }
+    async function describeLatestFrame() {
+      const button = document.querySelector('#describe-latest');
+      button.disabled = true;
+      button.textContent = 'Sending...';
+      try {
+        const response = await fetch('/describe-latest', { method: 'POST', cache: 'no-store' });
+        await response.json();
+        await refreshVlmHistory();
+      } finally {
+        button.disabled = false;
+        button.textContent = 'Send Latest Frame to VLM';
+      }
+    }
+    async function refreshVlmHistory() {
+      const history = await fetch('/vlm-history', { cache: 'no-store' }).then(r => r.json());
+      renderVlmHistory(history);
+    }
+    function renderVlmHistory(history) {
+      const container = document.querySelector('#llm-history');
+      if (!history.length) {
+        container.textContent = 'No VLM descriptions yet.';
+        return;
+      }
+      container.innerHTML = history.slice().reverse().map((entry, index) => {
+        const elapsed = entry.elapsed_ms == null ? '' : ` · ${Number(entry.elapsed_ms).toFixed(0)} ms`;
+        const content = escapeHtml(String(entry.content || ''));
+        const cls = entry.status === 'ok' ? '' : ' llm-error';
+        return `<div class="llm-entry${cls}"><div class="llm-meta">#${history.length - index} · ${entry.status}${elapsed}</div>${content}</div>`;
+      }).join('');
+    }
+    function escapeHtml(value) {
+      return value.replace(/[&<>"']/g, char => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;'
+      }[char]));
+    }
     document.querySelector('#get-latest').addEventListener('click', getLatestFrame);
+    document.querySelector('#describe-latest').addEventListener('click', describeLatestFrame);
     setInterval(tick, 500);
     tick();
   </script>
 </body>
-</html>"""
+</html>""".encode("utf-8")
 
 
 if __name__ == "__main__":
