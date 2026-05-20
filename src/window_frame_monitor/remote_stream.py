@@ -32,8 +32,6 @@ from window_frame_monitor.windows import list_windows, resolve_window
 STREAM_MAGIC = "WFH264/1"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 DEFAULT_VLM_MODEL = "qwen3-vl:8b-instruct"
-DEFAULT_QWEN_VLM_MODEL = "qwen3-vl:8b-instruct"
-DEFAULT_GEMMA_VLM_MODEL = "gemma3:4b"
 DEFAULT_VLM_SYSTEM_PROMPT = (
     "您好！辛苦啦！"
     "请问，可以请您作为一名视觉描述家，尝试描述眼前的游戏场景吗？描述可基于上下文想象其可能的行为过渡，描述文本限制在 20 字。"
@@ -260,8 +258,6 @@ class RemoteH264Receiver:
         pixel_format: str = "yuv420p",
         ollama_url: str = DEFAULT_OLLAMA_URL,
         vlm_model: str = DEFAULT_VLM_MODEL,
-        qwen_vlm_model: str = DEFAULT_QWEN_VLM_MODEL,
-        gemma_vlm_model: str = DEFAULT_GEMMA_VLM_MODEL,
         vlm_context_tokens: int = 40_000,
         vlm_max_output_tokens: int = 1000,
         vlm_system_prompt: str = DEFAULT_VLM_SYSTEM_PROMPT,
@@ -278,8 +274,6 @@ class RemoteH264Receiver:
         self._pixel_format = pixel_format
         self._ollama_url = ollama_url.rstrip("/")
         self._vlm_model = vlm_model
-        self._qwen_vlm_model = qwen_vlm_model
-        self._gemma_vlm_model = gemma_vlm_model
         self._vlm_context_tokens = max(1024, int(vlm_context_tokens))
         self._vlm_max_output_tokens = max(1, int(vlm_max_output_tokens))
         self._vlm_system_prompt = vlm_system_prompt
@@ -352,14 +346,12 @@ class RemoteH264Receiver:
                 "status": "error",
                 "detail": str(exc),
                 "selected": self._vlm_model,
-                "presets": self._vlm_presets(),
                 "models": [],
             }
         models = [str(model.get("name", "")) for model in body.get("models", []) if model.get("name")]
         return {
             "status": "ok",
             "selected": self._vlm_model,
-            "presets": self._vlm_presets(),
             "models": models,
         }
 
@@ -408,17 +400,7 @@ class RemoteH264Receiver:
     def _resolve_vlm_model(self, model: str | None) -> str:
         if not model or model == "default":
             return self._vlm_model
-        if model == "qwen":
-            return self._qwen_vlm_model
-        if model == "gemma":
-            return self._gemma_vlm_model
         return model
-
-    def _vlm_presets(self) -> list[dict[str, str]]:
-        return [
-            {"label": "Qwen Model", "value": "qwen", "model": self._qwen_vlm_model},
-            {"label": "Gemma Model", "value": "gemma", "model": self._gemma_vlm_model},
-        ]
 
     def _record_vlm_history(
         self,
@@ -707,8 +689,6 @@ def main() -> None:
     receiver.add_argument("--frame-format", default="yuv420p", choices=["yuv420p", "rgb24"])
     receiver.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL)
     receiver.add_argument("--vlm-model", default=DEFAULT_VLM_MODEL)
-    receiver.add_argument("--qwen-vlm-model", default=DEFAULT_QWEN_VLM_MODEL)
-    receiver.add_argument("--gemma-vlm-model", default=DEFAULT_GEMMA_VLM_MODEL)
     receiver.add_argument("--vlm-context-tokens", type=int, default=40_000)
     receiver.add_argument("--vlm-max-output-tokens", type=int, default=50)
     receiver.add_argument("--vlm-system-prompt", default=DEFAULT_VLM_SYSTEM_PROMPT)
@@ -745,8 +725,6 @@ def main() -> None:
             pixel_format=args.frame_format,
             ollama_url=args.ollama_url,
             vlm_model=args.vlm_model,
-            qwen_vlm_model=args.qwen_vlm_model,
-            gemma_vlm_model=args.gemma_vlm_model,
             vlm_context_tokens=args.vlm_context_tokens,
             vlm_max_output_tokens=args.vlm_max_output_tokens,
             vlm_system_prompt=args.vlm_system_prompt,
@@ -963,8 +941,7 @@ def _dashboard_html() -> bytes:
       <p id="status">waiting</p>
       <div class="actions">
         <select id="vlm-model" class="model-select" aria-label="VLM model">
-          <option value="qwen">Qwen Model</option>
-          <option value="gemma">Gemma Model</option>
+          <option value="">Loading Ollama models...</option>
         </select>
         <button id="refresh-models" class="secondary" type="button">Refresh Models</button>
         <button id="get-latest" type="button">Get Latest Frame</button>
@@ -1051,16 +1028,16 @@ def _dashboard_html() -> bytes:
       const current = select.value;
       const response = await fetch('/ollama-models', { cache: 'no-store' }).then(r => r.json());
       select.innerHTML = '';
-      for (const preset of response.presets || []) {
-        const option = document.createElement('option');
-        option.value = preset.value;
-        option.textContent = `${preset.label} (${preset.model})`;
-        select.appendChild(option);
-      }
       for (const model of response.models || []) {
         const option = document.createElement('option');
         option.value = model;
-        option.textContent = `Ollama: ${model}`;
+        option.textContent = model;
+        select.appendChild(option);
+      }
+      if (!select.options.length) {
+        const option = document.createElement('option');
+        option.value = '';
+        option.textContent = response.status === 'error' ? 'Unable to load Ollama models' : 'No Ollama models found';
         select.appendChild(option);
       }
       if ([...select.options].some(option => option.value === current)) {
@@ -1068,7 +1045,7 @@ def _dashboard_html() -> bytes:
       }
     }
     function selectedVlmModel() {
-      return document.querySelector('#vlm-model').value || 'qwen';
+      return document.querySelector('#vlm-model').value || 'default';
     }
     async function startLoop() {
       vlmLoopActive = true;
