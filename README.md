@@ -63,6 +63,12 @@ Open the receiver dashboard:
 http://127.0.0.1:8770/
 ```
 
+The receiver also includes a first-pass Minecraft visual agent loop. It uses the latest decoded frame, asks the configured Ollama VLM for a strict JSON decision, queues safe whitelisted key/mouse actions, and exposes pause/resume controls on the dashboard. The loop is enabled by default and can be paused at startup:
+
+```powershell
+py -3.12 -m window_frame_monitor.remote_stream receiver --stream-host 0.0.0.0 --stream-port 8766 --dashboard-port 8770 --no-agent-enabled
+```
+
 List windows on the sending machine:
 
 ```powershell
@@ -73,6 +79,12 @@ Send one selected window to the receiver:
 
 ```powershell
 py -3.12 -m window_frame_monitor.remote_stream sender --server-host TARGET_SERVER_IP --stream-port 8766 --hwnd WINDOW_HANDLE --fps 24 --encoder h264_nvenc --bitrate-kbps 4000
+```
+
+To let the sender poll and execute queued agent actions on the game machine:
+
+```powershell
+py -3.12 -m window_frame_monitor.remote_stream sender --server-host TARGET_SERVER_IP --stream-port 8766 --hwnd WINDOW_HANDLE --fps 24 --encoder h264_nvenc --agent-control-url http://RECEIVER_IP:8770 --execute-agent-actions
 ```
 
 For a local end-to-end test without a real capture target:

@@ -16,10 +16,12 @@ from io import BytesIO
 from pathlib import Path
 from time import perf_counter, perf_counter_ns, sleep
 from typing import BinaryIO
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from PIL import Image
 
+from window_frame_monitor.agent import MINECRAFT_AGENT_SYSTEM_PROMPT, MinecraftAgentOrchestrator
+from window_frame_monitor.agent_control import AgentActionPoller
 from window_frame_monitor.backends.base import CaptureBackend
 from window_frame_monitor.backends.dxgi import DxgiDesktopDuplicationBackend
 from window_frame_monitor.backends.test_pattern import TestPatternBackend
@@ -54,6 +56,8 @@ DEFAULT_VLM_SYSTEM_PROMPT = (
     "· [计划未来 15 份“时间步”的按键操作（仅返回操作按键）]"
 
 )
+
+DEFAULT_VLM_SYSTEM_PROMPT = MINECRAFT_AGENT_SYSTEM_PROMPT
 
 
 @dataclass(frozen=True)
@@ -259,6 +263,8 @@ class RemoteH264Receiver:
         vlm_context_tokens: int = 40_000,
         vlm_max_output_tokens: int = 1000,
         vlm_system_prompt: str = DEFAULT_VLM_SYSTEM_PROMPT,
+        agent_enabled: bool = True,
+        agent_tick_interval_s: float = 1.5,
     ) -> None:
         self.stream_host = stream_host
         self.stream_port = stream_port
@@ -292,6 +298,15 @@ class RemoteH264Receiver:
         self._network_times: deque[tuple[float, int]] = deque()
         self._received_total_bytes = 0
         self._network_lock = threading.Lock()
+        self.agent = MinecraftAgentOrchestrator(
+            latest_jpeg=self.latest_jpeg,
+            ollama_url=self._ollama_url,
+            vlm_model=self._vlm_model,
+            context_tokens=self._vlm_context_tokens,
+            max_output_tokens=max(200, self._vlm_max_output_tokens),
+            tick_interval_s=agent_tick_interval_s,
+        )
+        self.agent.set_control(enabled=agent_enabled)
 
     def start_stream_listener(self) -> None:
         self._stream_thread = threading.Thread(target=self._listen_for_streams, name="h264-stream-listener", daemon=True)
@@ -301,18 +316,21 @@ class RemoteH264Receiver:
         server = _ReceiverDashboardServer((self.dashboard_host, self.dashboard_port), self)
         print(f"Remote receiver dashboard at http://{self.dashboard_host}:{self.dashboard_port}/")
         print(f"H.264 stream listening on tcp://{self.stream_host}:{self.stream_port}")
+        self.agent.start()
         try:
             server.serve_forever()
         except KeyboardInterrupt:
             pass
         finally:
             self._stop.set()
+            self.agent.stop()
             server.server_close()
 
     def state(self) -> dict[str, object]:
         state = self._store.state()
         state["received_kib_per_s"] = self.received_kib_per_s()
         state["received_total_kib"] = self.received_total_kib()
+        state["agent"] = self.agent.state()
         return state
 
     def latest_jpeg(self) -> bytes | None:
@@ -513,13 +531,20 @@ class _ReceiverDashboardHandler(BaseHTTPRequestHandler):
     server: _ReceiverDashboardServer
 
     def do_GET(self) -> None:
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
         if path == "/":
             self._send_bytes(_dashboard_html(), "text/html; charset=utf-8")
         elif path == "/state":
             self._send_json(self.server.receiver.state())
         elif path == "/vlm-history":
             self._send_json(self.server.receiver.vlm_history())
+        elif path == "/agent/history":
+            self._send_json(self.server.receiver.agent.history())
+        elif path == "/agent/actions/pending":
+            query = parse_qs(parsed.query)
+            limit = int(query.get("limit", ["1"])[0])
+            self._send_json(self.server.receiver.agent.pending_actions(limit=limit))
         elif path == "/latest.jpg":
             jpeg = self.server.receiver.latest_jpeg()
             if jpeg is None:
@@ -533,6 +558,23 @@ class _ReceiverDashboardHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/describe-latest":
             self._send_json(self.server.receiver.describe_latest_frame())
+        elif path == "/agent/tick":
+            self._send_json(self.server.receiver.agent.tick())
+        elif path == "/agent/control":
+            body = self._read_json_body()
+            self._send_json(
+                self.server.receiver.agent.set_control(
+                    enabled=body.get("enabled") if "enabled" in body else None,
+                    tick_interval_s=float(body["tick_interval_s"]) if body.get("tick_interval_s") is not None else None,
+                )
+            )
+        elif path == "/agent/actions/ack":
+            body = self._read_json_body()
+            batch_id = str(body.get("id", ""))
+            if not batch_id:
+                self.send_error(HTTPStatus.BAD_REQUEST, "Missing action batch id.")
+                return
+            self._send_json(self.server.receiver.agent.ack_action(batch_id, body))
         else:
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
@@ -540,7 +582,14 @@ class _ReceiverDashboardHandler(BaseHTTPRequestHandler):
         return None
 
     def _send_json(self, value: object) -> None:
-        self._send_bytes(json.dumps(value).encode("utf-8"), "application/json; charset=utf-8")
+        self._send_bytes(json.dumps(value, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+
+    def _read_json_body(self) -> dict[str, object]:
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0:
+            return {}
+        body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+        return body if isinstance(body, dict) else {}
 
     def _send_bytes(self, data: bytes, content_type: str) -> None:
         self.send_response(HTTPStatus.OK)
@@ -563,6 +612,9 @@ def run_sender(
     output_height: int | None = None,
     duration_s: float | None = None,
     use_test_backend: bool = False,
+    agent_control_url: str | None = None,
+    execute_agent_actions: bool = False,
+    action_poll_ms: int = 250,
 ) -> None:
     backend = _select_sender_backend(use_test_backend=use_test_backend)
     width = output_width or target.width
@@ -585,6 +637,10 @@ def run_sender(
     )
     stderr_thread.start()
     backend.start(target)
+    action_poller: AgentActionPoller | None = None
+    if execute_agent_actions and agent_control_url:
+        action_poller = AgentActionPoller(control_url=agent_control_url, target=target, poll_ms=action_poll_ms)
+        action_poller.start()
     sent_frames = 0
     print(
         f"Sending H.264 stream to {server_host}:{stream_port} "
@@ -615,6 +671,8 @@ def run_sender(
                 elapsed = perf_counter() - loop_started
                 sleep(max(0.0, interval_s - elapsed))
         finally:
+            if action_poller:
+                action_poller.stop()
             backend.stop()
             try:
                 encoder_process.stdin.close()
@@ -649,6 +707,8 @@ def main() -> None:
     receiver.add_argument("--vlm-context-tokens", type=int, default=40_000)
     receiver.add_argument("--vlm-max-output-tokens", type=int, default=50)
     receiver.add_argument("--vlm-system-prompt", default=DEFAULT_VLM_SYSTEM_PROMPT)
+    receiver.add_argument("--agent-enabled", action=argparse.BooleanOptionalAction, default=True)
+    receiver.add_argument("--agent-tick-interval-s", type=float, default=1.5)
 
     sender = subparsers.add_parser("sender", help="Capture a window and push H.264 to a receiver.")
     sender.add_argument("--server-host", required=True)
@@ -663,6 +723,9 @@ def main() -> None:
     sender.add_argument("--width", type=int)
     sender.add_argument("--height", type=int)
     sender.add_argument("--duration-s", type=float)
+    sender.add_argument("--agent-control-url")
+    sender.add_argument("--execute-agent-actions", action="store_true")
+    sender.add_argument("--action-poll-ms", type=int, default=250)
 
     lister = subparsers.add_parser("list-windows", help="List capturable windows as JSON.")
     lister.add_argument("--test-backend", action="store_true")
@@ -685,6 +748,8 @@ def main() -> None:
             vlm_context_tokens=args.vlm_context_tokens,
             vlm_max_output_tokens=args.vlm_max_output_tokens,
             vlm_system_prompt=args.vlm_system_prompt,
+            agent_enabled=args.agent_enabled,
+            agent_tick_interval_s=args.agent_tick_interval_s,
         )
         app.start_stream_listener()
         app.serve_dashboard()
@@ -701,6 +766,9 @@ def main() -> None:
             output_height=args.height,
             duration_s=args.duration_s,
             use_test_backend=args.test_backend,
+            agent_control_url=args.agent_control_url,
+            execute_agent_actions=args.execute_agent_actions,
+            action_poll_ms=args.action_poll_ms,
         )
     elif args.command == "list-windows":
         windows = [WindowInfo(hwnd=0, title="Test Pattern", process_name="test-pattern", width=640, height=360)] if args.test_backend else list_windows()
@@ -896,6 +964,8 @@ def _dashboard_html() -> bytes:
       <div class="actions">
         <button id="get-latest" type="button">Get Latest Frame</button>
         <button id="describe-latest" type="button">Send Latest Frame to VLM</button>
+        <button id="agent-toggle" type="button">Pause Agent</button>
+        <button id="agent-tick" type="button">Agent Tick</button>
       </div>
     </header>
     <section class="content">
@@ -915,7 +985,13 @@ def _dashboard_html() -> bytes:
         <div class="metric"><span>Change Score</span><strong id="change">0.000</strong></div>
         <div class="metric"><span>Changed Pixels</span><strong id="changed">0.0%</strong></div>
         <div class="metric"><span>Resolution</span><strong id="resolution">0x0</strong></div>
+        <div class="metric"><span>Agent</span><strong id="agent-state">enabled</strong></div>
+        <div class="metric"><span>Pending Actions</span><strong id="agent-pending">0</strong></div>
       </div>
+    </section>
+    <section>
+      <h2>Agent Decision</h2>
+      <pre id="agent-latest"></pre>
     </section>
     <section><pre id="raw"></pre></section>
   </main>
@@ -931,6 +1007,11 @@ def _dashboard_html() -> bytes:
       document.querySelector('#change').textContent = Number(state.change_score || 0).toFixed(3);
       document.querySelector('#changed').textContent = (Number(state.changed_pixels_ratio || 0) * 100).toFixed(1) + '%';
       document.querySelector('#resolution').textContent = `${state.width || 0}x${state.height || 0}`;
+      const agent = state.agent || {};
+      document.querySelector('#agent-state').textContent = agent.enabled ? 'enabled' : 'paused';
+      document.querySelector('#agent-pending').textContent = agent.pending_count || 0;
+      document.querySelector('#agent-toggle').textContent = agent.enabled ? 'Pause Agent' : 'Resume Agent';
+      document.querySelector('#agent-latest').textContent = JSON.stringify(agent.latest || {}, null, 2);
       document.querySelector('#raw').textContent = JSON.stringify(state, null, 2);
       await refreshVlmHistory();
     }
@@ -953,6 +1034,19 @@ def _dashboard_html() -> bytes:
         button.disabled = false;
         button.textContent = 'Send Latest Frame to VLM';
       }
+    }
+    async function toggleAgent() {
+      const state = await fetch('/state', { cache: 'no-store' }).then(r => r.json());
+      await fetch('/agent/control', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: !(state.agent && state.agent.enabled) })
+      });
+      await tick();
+    }
+    async function runAgentTick() {
+      await fetch('/agent/tick', { method: 'POST', cache: 'no-store' });
+      await tick();
     }
     async function refreshVlmHistory() {
       const history = await fetch('/vlm-history', { cache: 'no-store' }).then(r => r.json());
@@ -982,6 +1076,8 @@ def _dashboard_html() -> bytes:
     }
     document.querySelector('#get-latest').addEventListener('click', getLatestFrame);
     document.querySelector('#describe-latest').addEventListener('click', describeLatestFrame);
+    document.querySelector('#agent-toggle').addEventListener('click', toggleAgent);
+    document.querySelector('#agent-tick').addEventListener('click', runAgentTick);
     setInterval(tick, 500);
     tick();
   </script>
