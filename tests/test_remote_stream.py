@@ -135,6 +135,10 @@ def test_receiver_dashboard_requests_latest_frame_manually():
     assert 'id="describe-latest"' in html
     assert "LLM History" in html
     assert "fetch('/describe-latest'" in html
+    assert 'id="vlm-model"' in html
+    assert 'id="start-loop"' in html
+    assert 'id="stop-loop"' in html
+    assert "fetch('/ollama-models'" in html
 
 
 def test_receiver_tracks_total_received_bytes():
@@ -160,6 +164,16 @@ def test_receiver_records_vlm_error_when_no_frame_is_available():
     assert event["status"] == "error"
     assert "No frame available" in str(event["content"])
     assert history[-1] == event
+
+
+def test_receiver_resolves_vlm_model_presets():
+    from window_frame_monitor.remote_stream import RemoteH264Receiver
+
+    receiver = RemoteH264Receiver(qwen_vlm_model="qwen-test", gemma_vlm_model="gemma-test")
+
+    assert receiver._resolve_vlm_model("qwen") == "qwen-test"
+    assert receiver._resolve_vlm_model("gemma") == "gemma-test"
+    assert receiver._resolve_vlm_model("custom-model") == "custom-model"
 
 
 def test_remote_frame_store_keeps_disconnect_detail(tmp_path: Path):

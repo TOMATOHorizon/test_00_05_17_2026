@@ -32,6 +32,8 @@ from window_frame_monitor.windows import list_windows, resolve_window
 STREAM_MAGIC = "WFH264/1"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 DEFAULT_VLM_MODEL = "qwen3-vl:8b-instruct"
+DEFAULT_QWEN_VLM_MODEL = "qwen3-vl:8b-instruct"
+DEFAULT_GEMMA_VLM_MODEL = "gemma3:4b"
 DEFAULT_VLM_SYSTEM_PROMPT = (
     "您好！辛苦啦！"
     "请问，可以请您作为一名视觉描述家，尝试描述眼前的游戏场景吗？描述可基于上下文想象其可能的行为过渡，描述文本限制在 20 字。"
@@ -214,11 +216,13 @@ class RemoteFrameStore:
         with self._lock:
             return dict(self._state)
 
-    def latest_jpeg(self) -> bytes | None:
+    def latest_jpeg(self, *, memory_only: bool = False) -> bytes | None:
         with self._lock:
             frame = self._latest_frame
         if frame is not None:
             return _encode_jpeg(self._to_rgb(frame), self._width, self._height)
+        if memory_only:
+            return None
         path = self._output_dir / "latest.jpg"
         return path.read_bytes() if path.exists() else None
 
@@ -256,6 +260,8 @@ class RemoteH264Receiver:
         pixel_format: str = "yuv420p",
         ollama_url: str = DEFAULT_OLLAMA_URL,
         vlm_model: str = DEFAULT_VLM_MODEL,
+        qwen_vlm_model: str = DEFAULT_QWEN_VLM_MODEL,
+        gemma_vlm_model: str = DEFAULT_GEMMA_VLM_MODEL,
         vlm_context_tokens: int = 40_000,
         vlm_max_output_tokens: int = 1000,
         vlm_system_prompt: str = DEFAULT_VLM_SYSTEM_PROMPT,
@@ -272,6 +278,8 @@ class RemoteH264Receiver:
         self._pixel_format = pixel_format
         self._ollama_url = ollama_url.rstrip("/")
         self._vlm_model = vlm_model
+        self._qwen_vlm_model = qwen_vlm_model
+        self._gemma_vlm_model = gemma_vlm_model
         self._vlm_context_tokens = max(1024, int(vlm_context_tokens))
         self._vlm_max_output_tokens = max(1, int(vlm_max_output_tokens))
         self._vlm_system_prompt = vlm_system_prompt
@@ -318,23 +326,44 @@ class RemoteH264Receiver:
     def latest_jpeg(self) -> bytes | None:
         return self._store.latest_jpeg()
 
-    def describe_latest_frame(self) -> dict[str, object]:
-        jpeg = self.latest_jpeg()
+    def describe_latest_frame(self, model: str | None = None) -> dict[str, object]:
+        jpeg = self._store.latest_jpeg(memory_only=True)
+        selected_model = self._resolve_vlm_model(model)
         if jpeg is None:
-            return self._record_vlm_history("error", "No frame available yet.")
+            return self._record_vlm_history("error", "No frame available yet.", model=selected_model)
         started = perf_counter()
         try:
-            description = self._call_ollama_vlm(jpeg)
+            description = self._call_ollama_vlm(jpeg, model=selected_model)
         except Exception as exc:
-            return self._record_vlm_history("error", str(exc))
+            return self._record_vlm_history("error", str(exc), model=selected_model)
         elapsed_ms = (perf_counter() - started) * 1000
-        return self._record_vlm_history("ok", description, elapsed_ms=elapsed_ms)
+        return self._record_vlm_history("ok", description, elapsed_ms=elapsed_ms, model=selected_model)
 
     def vlm_history(self) -> list[dict[str, object]]:
         with self._vlm_lock:
             return list(self._vlm_history)
 
-    def _call_ollama_vlm(self, jpeg: bytes) -> str:
+    def ollama_models(self) -> dict[str, object]:
+        try:
+            with urllib.request.urlopen(f"{self._ollama_url}/api/tags", timeout=10) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except Exception as exc:
+            return {
+                "status": "error",
+                "detail": str(exc),
+                "selected": self._vlm_model,
+                "presets": self._vlm_presets(),
+                "models": [],
+            }
+        models = [str(model.get("name", "")) for model in body.get("models", []) if model.get("name")]
+        return {
+            "status": "ok",
+            "selected": self._vlm_model,
+            "presets": self._vlm_presets(),
+            "models": models,
+        }
+
+    def _call_ollama_vlm(self, jpeg: bytes, *, model: str) -> str:
         user_content = ""
         image_b64 = base64.b64encode(jpeg).decode("ascii")
         with self._vlm_lock:
@@ -344,9 +373,10 @@ class RemoteH264Receiver:
                 {"role": "user", "content": user_content, "images": [image_b64]},
             ]
         payload = {
-            "model": self._vlm_model,
+            "model": model,
             "messages": messages,
             "stream": False,
+            "think": False,
             "options": {
                 "num_ctx": self._vlm_context_tokens,
                 "num_predict": self._vlm_max_output_tokens,
@@ -375,17 +405,34 @@ class RemoteH264Receiver:
             self._trim_vlm_messages_locked()
         return content
 
+    def _resolve_vlm_model(self, model: str | None) -> str:
+        if not model or model == "default":
+            return self._vlm_model
+        if model == "qwen":
+            return self._qwen_vlm_model
+        if model == "gemma":
+            return self._gemma_vlm_model
+        return model
+
+    def _vlm_presets(self) -> list[dict[str, str]]:
+        return [
+            {"label": "Qwen Model", "value": "qwen", "model": self._qwen_vlm_model},
+            {"label": "Gemma Model", "value": "gemma", "model": self._gemma_vlm_model},
+        ]
+
     def _record_vlm_history(
         self,
         status: str,
         content: str,
         *,
         elapsed_ms: float | None = None,
+        model: str | None = None,
     ) -> dict[str, object]:
         event: dict[str, object] = {
             "status": status,
             "content": content,
             "elapsed_ms": elapsed_ms,
+            "model": model,
             "time_ns": perf_counter_ns(),
         }
         with self._vlm_lock:
@@ -520,6 +567,8 @@ class _ReceiverDashboardHandler(BaseHTTPRequestHandler):
             self._send_json(self.server.receiver.state())
         elif path == "/vlm-history":
             self._send_json(self.server.receiver.vlm_history())
+        elif path == "/ollama-models":
+            self._send_json(self.server.receiver.ollama_models())
         elif path == "/latest.jpg":
             jpeg = self.server.receiver.latest_jpeg()
             if jpeg is None:
@@ -532,7 +581,7 @@ class _ReceiverDashboardHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         if path == "/describe-latest":
-            self._send_json(self.server.receiver.describe_latest_frame())
+            self._send_json(self.server.receiver.describe_latest_frame(self._read_json_body().get("model")))
         else:
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
@@ -541,6 +590,18 @@ class _ReceiverDashboardHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, value: object) -> None:
         self._send_bytes(json.dumps(value).encode("utf-8"), "application/json; charset=utf-8")
+
+    def _read_json_body(self) -> dict[str, object]:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            return {}
+        if length <= 0:
+            return {}
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8"))
+        except json.JSONDecodeError:
+            return {}
 
     def _send_bytes(self, data: bytes, content_type: str) -> None:
         self.send_response(HTTPStatus.OK)
@@ -646,6 +707,8 @@ def main() -> None:
     receiver.add_argument("--frame-format", default="yuv420p", choices=["yuv420p", "rgb24"])
     receiver.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL)
     receiver.add_argument("--vlm-model", default=DEFAULT_VLM_MODEL)
+    receiver.add_argument("--qwen-vlm-model", default=DEFAULT_QWEN_VLM_MODEL)
+    receiver.add_argument("--gemma-vlm-model", default=DEFAULT_GEMMA_VLM_MODEL)
     receiver.add_argument("--vlm-context-tokens", type=int, default=40_000)
     receiver.add_argument("--vlm-max-output-tokens", type=int, default=50)
     receiver.add_argument("--vlm-system-prompt", default=DEFAULT_VLM_SYSTEM_PROMPT)
@@ -682,6 +745,8 @@ def main() -> None:
             pixel_format=args.frame_format,
             ollama_url=args.ollama_url,
             vlm_model=args.vlm_model,
+            qwen_vlm_model=args.qwen_vlm_model,
+            gemma_vlm_model=args.gemma_vlm_model,
             vlm_context_tokens=args.vlm_context_tokens,
             vlm_max_output_tokens=args.vlm_max_output_tokens,
             vlm_system_prompt=args.vlm_system_prompt,
@@ -872,6 +937,9 @@ def _dashboard_html() -> bytes:
     .metric span { display: block; color: #aeb7c6; font-size: 12px; }
     .metric strong { display: block; margin-top: 4px; font-size: 20px; }
     .actions { display: flex; flex-wrap: wrap; gap: 10px; }
+    .model-select { background: #151a23; border: 1px solid #3a4658; border-radius: 6px; color: #f5f7fb; min-height: 36px; min-width: 240px; padding: 0 10px; }
+    .secondary { background: #1d2430; border-color: #3a4658; }
+    .danger { background: #7f1d1d; border-color: #ef4444; }
     .content { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 14px; align-items: stretch; }
     .preview { display: grid; place-items: center; background: #07090d; min-height: 320px; border: 1px solid #29313d; border-radius: 6px; }
     .llm-panel { border: 1px solid #29313d; border-radius: 6px; background: #0b0e13; padding: 12px; min-height: 320px; display: grid; grid-template-rows: auto 1fr; gap: 10px; }
@@ -894,8 +962,15 @@ def _dashboard_html() -> bytes:
       <h1>Remote H.264 Receiver</h1>
       <p id="status">waiting</p>
       <div class="actions">
+        <select id="vlm-model" class="model-select" aria-label="VLM model">
+          <option value="qwen">Qwen Model</option>
+          <option value="gemma">Gemma Model</option>
+        </select>
+        <button id="refresh-models" class="secondary" type="button">Refresh Models</button>
         <button id="get-latest" type="button">Get Latest Frame</button>
         <button id="describe-latest" type="button">Send Latest Frame to VLM</button>
+        <button id="start-loop" type="button">Start Loop</button>
+        <button id="stop-loop" class="danger" type="button" disabled>Stop Loop</button>
       </div>
     </header>
     <section class="content">
@@ -920,6 +995,8 @@ def _dashboard_html() -> bytes:
     <section><pre id="raw"></pre></section>
   </main>
   <script>
+    let vlmLoopActive = false;
+
     async function tick() {
       const state = await fetch('/state', { cache: 'no-store' }).then(r => r.json());
       document.querySelector('#status').textContent = state.status + (state.detail ? ' - ' + state.detail : '');
@@ -946,13 +1023,66 @@ def _dashboard_html() -> bytes:
       button.disabled = true;
       button.textContent = 'Sending...';
       try {
-        const response = await fetch('/describe-latest', { method: 'POST', cache: 'no-store' });
+        const response = await fetch('/describe-latest', {
+          method: 'POST',
+          cache: 'no-store',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: selectedVlmModel() })
+        });
         await response.json();
         await refreshVlmHistory();
       } finally {
         button.disabled = false;
         button.textContent = 'Send Latest Frame to VLM';
       }
+    }
+    async function describeLatestFrameForLoop() {
+      const response = await fetch('/describe-latest', {
+        method: 'POST',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: selectedVlmModel() })
+      });
+      await response.json();
+      await refreshVlmHistory();
+    }
+    async function loadOllamaModels() {
+      const select = document.querySelector('#vlm-model');
+      const current = select.value;
+      const response = await fetch('/ollama-models', { cache: 'no-store' }).then(r => r.json());
+      select.innerHTML = '';
+      for (const preset of response.presets || []) {
+        const option = document.createElement('option');
+        option.value = preset.value;
+        option.textContent = `${preset.label} (${preset.model})`;
+        select.appendChild(option);
+      }
+      for (const model of response.models || []) {
+        const option = document.createElement('option');
+        option.value = model;
+        option.textContent = `Ollama: ${model}`;
+        select.appendChild(option);
+      }
+      if ([...select.options].some(option => option.value === current)) {
+        select.value = current;
+      }
+    }
+    function selectedVlmModel() {
+      return document.querySelector('#vlm-model').value || 'qwen';
+    }
+    async function startLoop() {
+      vlmLoopActive = true;
+      document.querySelector('#start-loop').disabled = true;
+      document.querySelector('#stop-loop').disabled = false;
+      while (vlmLoopActive) {
+        await describeLatestFrameForLoop();
+        await new Promise(resolve => requestAnimationFrame(resolve));
+      }
+      document.querySelector('#start-loop').disabled = false;
+      document.querySelector('#stop-loop').disabled = true;
+    }
+    function stopLoop() {
+      vlmLoopActive = false;
     }
     async function refreshVlmHistory() {
       const history = await fetch('/vlm-history', { cache: 'no-store' }).then(r => r.json());
@@ -980,9 +1110,13 @@ def _dashboard_html() -> bytes:
         "'": '&#39;'
       }[char]));
     }
+    document.querySelector('#refresh-models').addEventListener('click', loadOllamaModels);
     document.querySelector('#get-latest').addEventListener('click', getLatestFrame);
     document.querySelector('#describe-latest').addEventListener('click', describeLatestFrame);
+    document.querySelector('#start-loop').addEventListener('click', startLoop);
+    document.querySelector('#stop-loop').addEventListener('click', stopLoop);
     setInterval(tick, 500);
+    loadOllamaModels().catch(() => {});
     tick();
   </script>
 </body>
