@@ -138,7 +138,10 @@ def test_receiver_dashboard_requests_latest_frame_manually():
     assert 'id="vlm-model"' in html
     assert 'id="start-loop"' in html
     assert 'id="stop-loop"' in html
+    assert 'id="isolate-context"' in html
+    assert 'id="clear-context"' in html
     assert "fetch('/ollama-models'" in html
+    assert "fetch('/clear-vlm-context'" in html
     assert "Qwen Model" not in html
     assert "Gemma Model" not in html
 
@@ -166,6 +169,34 @@ def test_receiver_records_vlm_error_when_no_frame_is_available():
     assert event["status"] == "error"
     assert "No frame available" in str(event["content"])
     assert history[-1] == event
+
+
+def test_receiver_can_clear_vlm_context():
+    from window_frame_monitor.remote_stream import RemoteH264Receiver
+
+    receiver = RemoteH264Receiver()
+    receiver._vlm_messages.append({"role": "assistant", "content": "old"})
+
+    event = receiver.clear_vlm_context()
+
+    assert receiver._vlm_messages == []
+    assert event["content"] == "VLM context cleared."
+
+
+def test_gemma_large_models_get_thinking_options():
+    from window_frame_monitor.remote_stream import RemoteH264Receiver
+
+    receiver = RemoteH264Receiver()
+    options = receiver._model_options(["gemma3:27b", "qwen3-vl:8b-instruct"])
+
+    assert {"label": "gemma3:27b", "value": "gemma3:27b", "model": "gemma3:27b", "think": False} in options
+    assert {
+        "label": "gemma3:27b (thinking)",
+        "value": "gemma3:27b::thinking",
+        "model": "gemma3:27b",
+        "think": True,
+    } in options
+    assert not any(option["value"] == "qwen3-vl:8b-instruct::thinking" for option in options)
 
 
 def test_remote_frame_store_keeps_disconnect_detail(tmp_path: Path):

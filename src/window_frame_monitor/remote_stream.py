@@ -54,6 +54,12 @@ DEFAULT_VLM_SYSTEM_PROMPT = (
     "· [计划未来 15 份“时间步”的按键操作（仅返回操作按键）]"
 
 )
+DEFAULT_VLM_SYSTEM_PROMPT_V2 = (
+    "你是一个实时视觉描述器。只根据当前画面和必要上下文，"
+    "用简洁、具体、可执行的中文描述关键事物、位置关系和明显变化。"
+    "不要展开推理过程，不要复述规则，不要输出与画面无关的固定模板。"
+    "若信息不足，请直接说明不确定。回答控制在 1-2 句。"
+)
 
 
 @dataclass(frozen=True)
@@ -260,7 +266,7 @@ class RemoteH264Receiver:
         vlm_model: str = DEFAULT_VLM_MODEL,
         vlm_context_tokens: int = 40_000,
         vlm_max_output_tokens: int = 1000,
-        vlm_system_prompt: str = DEFAULT_VLM_SYSTEM_PROMPT,
+        vlm_system_prompt: str = DEFAULT_VLM_SYSTEM_PROMPT_V2,
     ) -> None:
         self.stream_host = stream_host
         self.stream_port = stream_port
@@ -320,22 +326,57 @@ class RemoteH264Receiver:
     def latest_jpeg(self) -> bytes | None:
         return self._store.latest_jpeg()
 
-    def describe_latest_frame(self, model: str | None = None) -> dict[str, object]:
+    def describe_latest_frame(
+        self,
+        model: str | None = None,
+        *,
+        think: bool = False,
+        isolate_context: bool = False,
+    ) -> dict[str, object]:
         jpeg = self._store.latest_jpeg(memory_only=True)
         selected_model = self._resolve_vlm_model(model)
         if jpeg is None:
-            return self._record_vlm_history("error", "No frame available yet.", model=selected_model)
+            return self._record_vlm_history(
+                "error",
+                "No frame available yet.",
+                model=selected_model,
+                think=think,
+                isolate_context=isolate_context,
+            )
         started = perf_counter()
         try:
-            description = self._call_ollama_vlm(jpeg, model=selected_model)
+            description = self._call_ollama_vlm(
+                jpeg,
+                model=selected_model,
+                think=think,
+                isolate_context=isolate_context,
+            )
         except Exception as exc:
-            return self._record_vlm_history("error", str(exc), model=selected_model)
+            return self._record_vlm_history(
+                "error",
+                str(exc),
+                model=selected_model,
+                think=think,
+                isolate_context=isolate_context,
+            )
         elapsed_ms = (perf_counter() - started) * 1000
-        return self._record_vlm_history("ok", description, elapsed_ms=elapsed_ms, model=selected_model)
+        return self._record_vlm_history(
+            "ok",
+            description,
+            elapsed_ms=elapsed_ms,
+            model=selected_model,
+            think=think,
+            isolate_context=isolate_context,
+        )
 
     def vlm_history(self) -> list[dict[str, object]]:
         with self._vlm_lock:
             return list(self._vlm_history)
+
+    def clear_vlm_context(self) -> dict[str, object]:
+        with self._vlm_lock:
+            self._vlm_messages.clear()
+        return self._record_vlm_history("ok", "VLM context cleared.")
 
     def ollama_models(self) -> dict[str, object]:
         try:
@@ -352,23 +393,23 @@ class RemoteH264Receiver:
         return {
             "status": "ok",
             "selected": self._vlm_model,
-            "models": models,
+            "models": self._model_options(models),
         }
 
-    def _call_ollama_vlm(self, jpeg: bytes, *, model: str) -> str:
+    def _call_ollama_vlm(self, jpeg: bytes, *, model: str, think: bool, isolate_context: bool) -> str:
         user_content = ""
         image_b64 = base64.b64encode(jpeg).decode("ascii")
         with self._vlm_lock:
             messages = [
                 {"role": "system", "content": self._vlm_system_prompt},
-                *self._vlm_messages,
+                *(self._vlm_messages if not isolate_context else []),
                 {"role": "user", "content": user_content, "images": [image_b64]},
             ]
         payload = {
             "model": model,
             "messages": messages,
             "stream": False,
-            "think": False,
+            "think": think,
             "options": {
                 "num_ctx": self._vlm_context_tokens,
                 "num_predict": self._vlm_max_output_tokens,
@@ -391,16 +432,32 @@ class RemoteH264Receiver:
         content = str(body.get("message", {}).get("content", "")).strip()
         if not content:
             raise RuntimeError("Ollama returned an empty description.")
-        with self._vlm_lock:
-            self._vlm_messages.append({"role": "user", "content": user_content})
-            self._vlm_messages.append({"role": "assistant", "content": content})
-            self._trim_vlm_messages_locked()
+        if not isolate_context:
+            with self._vlm_lock:
+                self._vlm_messages.append({"role": "user", "content": user_content})
+                self._vlm_messages.append({"role": "assistant", "content": content})
+                self._trim_vlm_messages_locked()
         return content
 
     def _resolve_vlm_model(self, model: str | None) -> str:
         if not model or model == "default":
             return self._vlm_model
         return model
+
+    def _model_options(self, models: list[str]) -> list[dict[str, object]]:
+        options: list[dict[str, object]] = []
+        for model in models:
+            options.append({"label": model, "value": model, "model": model, "think": False})
+            if _is_gemma_thinking_candidate(model):
+                options.append(
+                    {
+                        "label": f"{model} (thinking)",
+                        "value": f"{model}::thinking",
+                        "model": model,
+                        "think": True,
+                    }
+                )
+        return options
 
     def _record_vlm_history(
         self,
@@ -409,12 +466,16 @@ class RemoteH264Receiver:
         *,
         elapsed_ms: float | None = None,
         model: str | None = None,
+        think: bool = False,
+        isolate_context: bool = False,
     ) -> dict[str, object]:
         event: dict[str, object] = {
             "status": status,
             "content": content,
             "elapsed_ms": elapsed_ms,
             "model": model,
+            "think": think,
+            "isolate_context": isolate_context,
             "time_ns": perf_counter_ns(),
         }
         with self._vlm_lock:
@@ -563,7 +624,16 @@ class _ReceiverDashboardHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         if path == "/describe-latest":
-            self._send_json(self.server.receiver.describe_latest_frame(self._read_json_body().get("model")))
+            body = self._read_json_body()
+            self._send_json(
+                self.server.receiver.describe_latest_frame(
+                    str(body.get("model", "")),
+                    think=bool(body.get("think", False)),
+                    isolate_context=bool(body.get("isolate_context", False)),
+                )
+            )
+        elif path == "/clear-vlm-context":
+            self._send_json(self.server.receiver.clear_vlm_context())
         else:
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
@@ -691,7 +761,7 @@ def main() -> None:
     receiver.add_argument("--vlm-model", default=DEFAULT_VLM_MODEL)
     receiver.add_argument("--vlm-context-tokens", type=int, default=40_000)
     receiver.add_argument("--vlm-max-output-tokens", type=int, default=50)
-    receiver.add_argument("--vlm-system-prompt", default=DEFAULT_VLM_SYSTEM_PROMPT)
+    receiver.add_argument("--vlm-system-prompt", default=DEFAULT_VLM_SYSTEM_PROMPT_V2)
 
     sender = subparsers.add_parser("sender", help="Capture a window and push H.264 to a receiver.")
     sender.add_argument("--server-host", required=True)
@@ -886,6 +956,11 @@ def decoded_frame_size(*, width: int, height: int, pixel_format: str) -> int:
     raise ValueError(f"Unsupported decoded pixel format: {pixel_format}")
 
 
+def _is_gemma_thinking_candidate(model: str) -> bool:
+    normalized = model.lower().replace("_", "-")
+    return ("gemma" in normalized or "gemass" in normalized) and ("26b" in normalized or "27b" in normalized)
+
+
 def _close_process(process: subprocess.Popen[bytes]) -> None:
     try:
         process.wait(timeout=1)
@@ -916,6 +991,7 @@ def _dashboard_html() -> bytes:
     .metric strong { display: block; margin-top: 4px; font-size: 20px; }
     .actions { display: flex; flex-wrap: wrap; gap: 10px; }
     .model-select { background: #151a23; border: 1px solid #3a4658; border-radius: 6px; color: #f5f7fb; min-height: 36px; min-width: 240px; padding: 0 10px; }
+    .toggle { display: inline-flex; align-items: center; gap: 6px; color: #c9d3e1; font-size: 13px; min-height: 36px; }
     .secondary { background: #1d2430; border-color: #3a4658; }
     .danger { background: #7f1d1d; border-color: #ef4444; }
     .content { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 14px; align-items: stretch; }
@@ -944,6 +1020,8 @@ def _dashboard_html() -> bytes:
           <option value="">Loading Ollama models...</option>
         </select>
         <button id="refresh-models" class="secondary" type="button">Refresh Models</button>
+        <label class="toggle"><input id="isolate-context" type="checkbox" /> Isolate Context</label>
+        <button id="clear-context" class="secondary" type="button">Clear Context</button>
         <button id="get-latest" type="button">Get Latest Frame</button>
         <button id="describe-latest" type="button">Send Latest Frame to VLM</button>
         <button id="start-loop" type="button">Start Loop</button>
@@ -1004,7 +1082,7 @@ def _dashboard_html() -> bytes:
           method: 'POST',
           cache: 'no-store',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ model: selectedVlmModel() })
+          body: JSON.stringify(selectedVlmRequest())
         });
         await response.json();
         await refreshVlmHistory();
@@ -1018,7 +1096,7 @@ def _dashboard_html() -> bytes:
         method: 'POST',
         cache: 'no-store',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: selectedVlmModel() })
+        body: JSON.stringify(selectedVlmRequest())
       });
       await response.json();
       await refreshVlmHistory();
@@ -1028,10 +1106,12 @@ def _dashboard_html() -> bytes:
       const current = select.value;
       const response = await fetch('/ollama-models', { cache: 'no-store' }).then(r => r.json());
       select.innerHTML = '';
-      for (const model of response.models || []) {
+      for (const item of response.models || []) {
         const option = document.createElement('option');
-        option.value = model;
-        option.textContent = model;
+        option.value = item.value || item.model || '';
+        option.textContent = item.label || item.model || option.value;
+        option.dataset.model = item.model || option.value;
+        option.dataset.think = item.think ? 'true' : 'false';
         select.appendChild(option);
       }
       if (!select.options.length) {
@@ -1044,8 +1124,17 @@ def _dashboard_html() -> bytes:
         select.value = current;
       }
     }
-    function selectedVlmModel() {
-      return document.querySelector('#vlm-model').value || 'default';
+    function selectedVlmRequest() {
+      const selected = document.querySelector('#vlm-model').selectedOptions[0];
+      return {
+        model: selected?.dataset.model || selected?.value || 'default',
+        think: selected?.dataset.think === 'true',
+        isolate_context: document.querySelector('#isolate-context').checked
+      };
+    }
+    async function clearContext() {
+      await fetch('/clear-vlm-context', { method: 'POST', cache: 'no-store' });
+      await refreshVlmHistory();
     }
     async function startLoop() {
       vlmLoopActive = true;
@@ -1088,6 +1177,7 @@ def _dashboard_html() -> bytes:
       }[char]));
     }
     document.querySelector('#refresh-models').addEventListener('click', loadOllamaModels);
+    document.querySelector('#clear-context').addEventListener('click', clearContext);
     document.querySelector('#get-latest').addEventListener('click', getLatestFrame);
     document.querySelector('#describe-latest').addEventListener('click', describeLatestFrame);
     document.querySelector('#start-loop').addEventListener('click', startLoop);
