@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import threading
 import urllib.error
 import urllib.request
@@ -146,6 +147,7 @@ class MinecraftAgentOrchestrator:
         self._messages: deque[dict[str, object]] = deque(maxlen=12)
         self._lock = threading.Lock()
         self._enabled = True
+        self._user_goal = ""
         self._loop_thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._tick_lock = threading.Lock()
@@ -167,16 +169,26 @@ class MinecraftAgentOrchestrator:
             return {
                 "enabled": self._enabled,
                 "tick_interval_s": self._tick_interval_s,
+                "user_goal": self._user_goal,
                 "pending_count": len(self._queue.pending(limit=100)),
                 "latest": latest,
             }
 
-    def set_control(self, *, enabled: bool | None = None, tick_interval_s: float | None = None) -> dict[str, object]:
+    def set_control(
+        self,
+        *,
+        enabled: bool | None = None,
+        tick_interval_s: float | None = None,
+        user_goal: str | None = None,
+    ) -> dict[str, object]:
         with self._lock:
             if enabled is not None:
                 self._enabled = bool(enabled)
             if tick_interval_s is not None:
                 self._tick_interval_s = max(0.25, float(tick_interval_s))
+            if user_goal is not None:
+                self._user_goal = user_goal.strip()[:500]
+                self._messages.clear()
         return self.state()
 
     def tick(self) -> dict[str, object]:
@@ -244,15 +256,10 @@ class MinecraftAgentOrchestrator:
 
     def _call_ollama(self, jpeg: bytes) -> str:
         image_b64 = base64.b64encode(jpeg).decode("ascii")
-        with self._lock:
-            history_messages = list(self._messages)
+        messages = self._build_ollama_messages(image_b64)
         payload = {
             "model": self._vlm_model,
-            "messages": [
-                {"role": "system", "content": MINECRAFT_AGENT_SYSTEM_PROMPT},
-                *history_messages,
-                {"role": "user", "content": "Analyze this Minecraft frame and return the next JSON decision.", "images": [image_b64]},
-            ],
+            "messages": messages,
             "stream": False,
             "options": {
                 "num_ctx": self._context_tokens,
@@ -277,6 +284,26 @@ class MinecraftAgentOrchestrator:
         if not content:
             raise RuntimeError("Ollama returned an empty agent decision.")
         return content
+
+    def _build_ollama_messages(self, image_b64: str) -> list[dict[str, object]]:
+        with self._lock:
+            history_messages = list(self._messages)
+            user_goal = self._user_goal
+        goal_instruction = (
+            f"User priority goal: {user_goal}\n"
+            "Complete this goal first. After it appears completed, continue with the default Minecraft survival/tree objective."
+            if user_goal
+            else "No user priority goal is set. Continue with the default Minecraft survival/tree objective."
+        )
+        return [
+            {"role": "system", "content": MINECRAFT_AGENT_SYSTEM_PROMPT},
+            *history_messages,
+            {
+                "role": "user",
+                "content": f"{goal_instruction}\nAnalyze this Minecraft frame and return the next JSON decision.",
+                "images": [image_b64],
+            },
+        ]
 
 
 def parse_agent_decision(content: str) -> dict[str, object]:
@@ -367,6 +394,16 @@ def _require_dict(payload: dict[str, object], key: str) -> dict[str, object]:
 
 
 def _load_json_from_text(content: str) -> object:
+    text = _extract_json_candidate(content)
+    for candidate in (text, repair_json_text(text)):
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    raise AgentDecisionError("No valid JSON object found in agent response after repair.")
+
+
+def _extract_json_candidate(content: str) -> str:
     text = content.strip()
     if text.startswith("```"):
         lines = text.splitlines()
@@ -375,11 +412,26 @@ def _load_json_from_text(content: str) -> object:
         if lines and lines[-1].startswith("```"):
             lines = lines[:-1]
         text = "\n".join(lines).strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            raise AgentDecisionError("No JSON object found in agent response.")
-        return json.loads(text[start : end + 1])
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise AgentDecisionError("No JSON object found in agent response.")
+    return text[start : end + 1]
+
+
+def repair_json_text(text: str) -> str:
+    """Repair common VLM JSON formatting slips without changing field meaning."""
+    repaired = text.strip()
+    repaired = repaired.replace("\u201c", '"').replace("\u201d", '"').replace("\u2018", "'").replace("\u2019", "'")
+    repaired = repaired.replace("，", ",").replace("：", ":")
+    repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+    repaired = re.sub(
+        r'((?:"(?:\\.|[^"\\])*")|(?:\btrue\b|\bfalse\b|\bnull\b)|[}\]]|-?\d+(?:\.\d+)?)\s*\n\s*("[^"\n]+"\s*:)',
+        r"\1,\n\2",
+        repaired,
+    )
+    repaired = re.sub(r'([}\]])\s*(?="[^"\n]+"\s*:)', r"\1,\n", repaired)
+    repaired = re.sub(r'("[^"\n]+"\s*:)\s*True\b', r"\1 true", repaired)
+    repaired = re.sub(r'("[^"\n]+"\s*:)\s*False\b', r"\1 false", repaired)
+    repaired = re.sub(r'("[^"\n]+"\s*:)\s*None\b', r"\1 null", repaired)
+    return repaired

@@ -566,6 +566,7 @@ class _ReceiverDashboardHandler(BaseHTTPRequestHandler):
                 self.server.receiver.agent.set_control(
                     enabled=body.get("enabled") if "enabled" in body else None,
                     tick_interval_s=float(body["tick_interval_s"]) if body.get("tick_interval_s") is not None else None,
+                    user_goal=str(body["user_goal"]) if "user_goal" in body else None,
                 )
             )
         elif path == "/agent/actions/ack":
@@ -940,6 +941,8 @@ def _dashboard_html() -> bytes:
     .metric span { display: block; color: #aeb7c6; font-size: 12px; }
     .metric strong { display: block; margin-top: 4px; font-size: 20px; }
     .actions { display: flex; flex-wrap: wrap; gap: 10px; }
+    .goal-form { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+    .goal-form input { flex: 1 1 360px; min-height: 36px; border-radius: 6px; border: 1px solid #29313d; background: #0b0e13; color: #f5f7fb; padding: 0 10px; }
     .content { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 14px; align-items: stretch; }
     .preview { display: grid; place-items: center; background: #07090d; min-height: 320px; border: 1px solid #29313d; border-radius: 6px; }
     .llm-panel { border: 1px solid #29313d; border-radius: 6px; background: #0b0e13; padding: 12px; min-height: 320px; display: grid; grid-template-rows: auto 1fr; gap: 10px; }
@@ -967,6 +970,11 @@ def _dashboard_html() -> bytes:
         <button id="agent-toggle" type="button">Pause Agent</button>
         <button id="agent-tick" type="button">Agent Tick</button>
       </div>
+      <form id="goal-form" class="goal-form">
+        <input id="agent-goal" type="text" placeholder="Priority goal for the agent" />
+        <button type="submit">Set Goal</button>
+        <button id="clear-goal" type="button">Clear Goal</button>
+      </form>
     </header>
     <section class="content">
       <div class="preview"><img id="latest" alt="Latest decoded frame" /></div>
@@ -987,6 +995,7 @@ def _dashboard_html() -> bytes:
         <div class="metric"><span>Resolution</span><strong id="resolution">0x0</strong></div>
         <div class="metric"><span>Agent</span><strong id="agent-state">enabled</strong></div>
         <div class="metric"><span>Pending Actions</span><strong id="agent-pending">0</strong></div>
+        <div class="metric"><span>Priority Goal</span><strong id="agent-goal-label">none</strong></div>
       </div>
     </section>
     <section>
@@ -1010,6 +1019,10 @@ def _dashboard_html() -> bytes:
       const agent = state.agent || {};
       document.querySelector('#agent-state').textContent = agent.enabled ? 'enabled' : 'paused';
       document.querySelector('#agent-pending').textContent = agent.pending_count || 0;
+      document.querySelector('#agent-goal-label').textContent = agent.user_goal || 'none';
+      if (document.activeElement !== document.querySelector('#agent-goal')) {
+        document.querySelector('#agent-goal').value = agent.user_goal || '';
+      }
       document.querySelector('#agent-toggle').textContent = agent.enabled ? 'Pause Agent' : 'Resume Agent';
       document.querySelector('#agent-latest').textContent = JSON.stringify(agent.latest || {}, null, 2);
       document.querySelector('#raw').textContent = JSON.stringify(state, null, 2);
@@ -1048,6 +1061,14 @@ def _dashboard_html() -> bytes:
       await fetch('/agent/tick', { method: 'POST', cache: 'no-store' });
       await tick();
     }
+    async function setAgentGoal(goal) {
+      await fetch('/agent/control', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_goal: goal })
+      });
+      await tick();
+    }
     async function refreshVlmHistory() {
       const history = await fetch('/vlm-history', { cache: 'no-store' }).then(r => r.json());
       renderVlmHistory(history);
@@ -1078,6 +1099,11 @@ def _dashboard_html() -> bytes:
     document.querySelector('#describe-latest').addEventListener('click', describeLatestFrame);
     document.querySelector('#agent-toggle').addEventListener('click', toggleAgent);
     document.querySelector('#agent-tick').addEventListener('click', runAgentTick);
+    document.querySelector('#goal-form').addEventListener('submit', event => {
+      event.preventDefault();
+      setAgentGoal(document.querySelector('#agent-goal').value);
+    });
+    document.querySelector('#clear-goal').addEventListener('click', () => setAgentGoal(''));
     setInterval(tick, 500);
     tick();
   </script>
