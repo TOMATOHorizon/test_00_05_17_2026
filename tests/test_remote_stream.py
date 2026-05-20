@@ -132,6 +132,9 @@ def test_receiver_dashboard_requests_latest_frame_manually():
     assert "Processed FPS" in html
     assert "Received" in html
     assert "Received Total" in html
+    assert 'id="describe-latest"' in html
+    assert "LLM History" in html
+    assert "fetch('/describe-latest'" in html
 
 
 def test_receiver_tracks_total_received_bytes():
@@ -144,6 +147,19 @@ def test_receiver_tracks_total_received_bytes():
     state = receiver.state()
 
     assert state["received_total_kib"] == 1.5
+
+
+def test_receiver_records_vlm_error_when_no_frame_is_available():
+    from window_frame_monitor.remote_stream import RemoteH264Receiver
+
+    receiver = RemoteH264Receiver()
+
+    event = receiver.describe_latest_frame()
+    history = receiver.vlm_history()
+
+    assert event["status"] == "error"
+    assert "No frame available" in str(event["content"])
+    assert history[-1] == event
 
 
 def test_remote_frame_store_keeps_disconnect_detail(tmp_path: Path):
