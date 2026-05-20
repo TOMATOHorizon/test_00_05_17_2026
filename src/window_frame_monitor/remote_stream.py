@@ -244,7 +244,7 @@ class RemoteH264Receiver:
     def __init__(
         self,
         *,
-        stream_host: str = "0.0.0.0",
+        stream_host: str = "127.0.0.1",
         stream_port: int = 8766,
         dashboard_host: str = "127.0.0.1",
         dashboard_port: int = 8770,
@@ -335,7 +335,7 @@ class RemoteH264Receiver:
             return list(self._vlm_history)
 
     def _call_ollama_vlm(self, jpeg: bytes) -> str:
-        user_content = "请简洁描述当前画面中的事物与关键内容。"
+        user_content = ""
         image_b64 = base64.b64encode(jpeg).decode("ascii")
         with self._vlm_lock:
             messages = [
