@@ -257,7 +257,7 @@ class RemoteH264Receiver:
         ollama_url: str = DEFAULT_OLLAMA_URL,
         vlm_model: str = DEFAULT_VLM_MODEL,
         vlm_context_tokens: int = 40_000,
-        vlm_max_output_tokens: int = 50,
+        vlm_max_output_tokens: int = 1000,
         vlm_system_prompt: str = DEFAULT_VLM_SYSTEM_PROMPT,
     ) -> None:
         self.stream_host = stream_host
