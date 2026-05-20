@@ -556,34 +556,37 @@ class _ReceiverDashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
-        if path == "/describe-latest":
-            self._send_json(self.server.receiver.describe_latest_frame())
-        elif path == "/agent/tick":
-            self._send_json(self.server.receiver.agent.tick())
-        elif path == "/agent/control":
-            body = self._read_json_body()
-            self._send_json(
-                self.server.receiver.agent.set_control(
-                    enabled=body.get("enabled") if "enabled" in body else None,
-                    tick_interval_s=float(body["tick_interval_s"]) if body.get("tick_interval_s") is not None else None,
-                    user_goal=str(body["user_goal"]) if "user_goal" in body else None,
+        try:
+            if path == "/describe-latest":
+                self._send_json(self.server.receiver.describe_latest_frame())
+            elif path == "/agent/tick":
+                self._send_json(self.server.receiver.agent.tick())
+            elif path == "/agent/control":
+                body = self._read_json_body()
+                self._send_json(
+                    self.server.receiver.agent.set_control(
+                        enabled=body.get("enabled") if "enabled" in body else None,
+                        tick_interval_s=float(body["tick_interval_s"]) if body.get("tick_interval_s") is not None else None,
+                        user_goal=str(body["user_goal"]) if "user_goal" in body else None,
+                    )
                 )
-            )
-        elif path == "/agent/actions/ack":
-            body = self._read_json_body()
-            batch_id = str(body.get("id", ""))
-            if not batch_id:
-                self.send_error(HTTPStatus.BAD_REQUEST, "Missing action batch id.")
-                return
-            self._send_json(self.server.receiver.agent.ack_action(batch_id, body))
-        else:
-            self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+            elif path == "/agent/actions/ack":
+                body = self._read_json_body()
+                batch_id = str(body.get("id", ""))
+                if not batch_id:
+                    self._send_json({"detail": "Missing action batch id."}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                self._send_json(self.server.receiver.agent.ack_action(batch_id, body))
+            else:
+                self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+        except (json.JSONDecodeError, ValueError) as exc:
+            self._send_json({"detail": str(exc)}, status=HTTPStatus.BAD_REQUEST)
 
     def log_message(self, format: str, *args: object) -> None:
         return None
 
-    def _send_json(self, value: object) -> None:
-        self._send_bytes(json.dumps(value, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+    def _send_json(self, value: object, status: HTTPStatus = HTTPStatus.OK) -> None:
+        self._send_bytes(json.dumps(value, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8", status=status)
 
     def _read_json_body(self) -> dict[str, object]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -592,8 +595,8 @@ class _ReceiverDashboardHandler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
         return body if isinstance(body, dict) else {}
 
-    def _send_bytes(self, data: bytes, content_type: str) -> None:
-        self.send_response(HTTPStatus.OK)
+    def _send_bytes(self, data: bytes, content_type: str, status: HTTPStatus = HTTPStatus.OK) -> None:
+        self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
@@ -1026,7 +1029,11 @@ def _dashboard_html() -> bytes:
       document.querySelector('#agent-toggle').textContent = agent.enabled ? 'Pause Agent' : 'Resume Agent';
       document.querySelector('#agent-latest').textContent = JSON.stringify(agent.latest || {}, null, 2);
       document.querySelector('#raw').textContent = JSON.stringify(state, null, 2);
-      await refreshVlmHistory();
+      try {
+        await refreshVlmHistory();
+      } catch (error) {
+        document.querySelector('#llm-history').textContent = 'Failed to load VLM history.';
+      }
     }
     async function getLatestFrame() {
       const response = await fetch('/latest.jpg?t=' + Date.now(), { cache: 'no-store' });
