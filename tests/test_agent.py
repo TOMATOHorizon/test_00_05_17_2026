@@ -36,6 +36,32 @@ def test_parse_agent_decision_extracts_json_from_extra_text():
     assert parsed["steps"] == ["face the trunk", "hold left mouse"]
 
 
+def test_parse_agent_decision_repairs_missing_comma_between_fields():
+    broken = """
+{
+  "observation": {
+    "description": "A tree is in front"
+    "change_summary": "The player moved closer"
+  },
+  "plan": {
+    "goal": "Break the tree"
+    "subtasks": ["aim", "hold attack"]
+  },
+  "steps": ["aim at trunk", "hold left mouse"],
+  "actions": [
+    {"type": "mouse", "button": "left", "state": "down", "duration_ms": 900}
+  ],
+  "confidence": 0.7,
+  "requires_human": false
+}
+"""
+
+    parsed = parse_agent_decision(broken)
+
+    assert parsed["observation"]["change_summary"] == "The player moved closer"
+    assert parsed["plan"]["goal"] == "Break the tree"
+
+
 def test_parse_agent_decision_rejects_illegal_key():
     payload = _decision(actions=[{"type": "key", "key": "escape", "state": "tap", "duration_ms": 50}])
 
@@ -118,3 +144,12 @@ def test_agent_tick_enqueues_valid_actions(monkeypatch):
     assert result["status"] == "ok"
     assert len(pending) == 1
     assert pending[0]["actions"][0]["type"] == "mouse"
+
+
+def test_agent_goal_is_stored_and_sent_to_model(monkeypatch):
+    agent = MinecraftAgentOrchestrator(latest_jpeg=lambda: None, ollama_url="http://127.0.0.1:1", vlm_model="mock")
+    agent.set_control(user_goal="go to the river")
+    messages = agent._build_ollama_messages("image-data")
+
+    assert agent.state()["user_goal"] == "go to the river"
+    assert "User priority goal: go to the river" in str(messages[-1]["content"])

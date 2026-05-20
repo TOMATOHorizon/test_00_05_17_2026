@@ -135,6 +135,8 @@ def test_receiver_dashboard_requests_latest_frame_manually():
     assert 'id="describe-latest"' in html
     assert "LLM History" in html
     assert "fetch('/describe-latest'" in html
+    assert 'id="agent-goal"' in html
+    assert "user_goal" in html
 
 
 def test_receiver_tracks_total_received_bytes():

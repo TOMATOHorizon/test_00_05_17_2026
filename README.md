@@ -69,6 +69,8 @@ The receiver also includes a first-pass Minecraft visual agent loop. It uses the
 py -3.12 -m window_frame_monitor.remote_stream receiver --stream-host 0.0.0.0 --stream-port 8766 --dashboard-port 8770 --no-agent-enabled
 ```
 
+The dashboard includes a priority goal input. When a goal is set there, each agent tick asks the model to complete that goal first; clearing the goal returns the agent to its default Minecraft tree/survival objective. The agent parser also attempts to repair common malformed JSON responses, such as missing commas between fields, before rejecting the model output.
+
 List windows on the sending machine:
 
 ```powershell
