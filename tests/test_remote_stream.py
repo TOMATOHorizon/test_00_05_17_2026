@@ -214,6 +214,27 @@ def test_ollama_content_extraction_falls_back_to_response():
     assert _extract_ollama_content({"response": "legacy answer"}) == "legacy answer"
 
 
+def test_gemma_content_extraction_can_split_channel_marker():
+    from window_frame_monitor.remote_stream import _extract_ollama_content
+
+    body = {
+        "message": {
+            "thinking": "Thinking Process: hidden notes <channel|>画面中央有一棵树，玩家正面朝向树干。<end_of_turn>",
+            "content": "",
+        }
+    }
+
+    assert _extract_ollama_content(body, model="gemma3:27b") == "画面中央有一棵树，玩家正面朝向树干。"
+
+
+def test_gemma_channel_split_does_not_apply_to_other_models():
+    from window_frame_monitor.remote_stream import _extract_ollama_content
+
+    body = {"message": {"thinking": "hidden <channel|>visible-ish", "content": ""}}
+
+    assert _extract_ollama_content(body, model="qwen3-vl:8b-instruct") == ""
+
+
 def test_remote_frame_store_keeps_disconnect_detail(tmp_path: Path):
     store = RemoteFrameStore(output_dir=tmp_path, width=16, height=16)
 

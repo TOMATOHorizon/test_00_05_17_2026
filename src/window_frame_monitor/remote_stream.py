@@ -429,7 +429,7 @@ class RemoteH264Receiver:
             raise RuntimeError(f"Ollama HTTP {exc.code}: {detail}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Ollama request failed: {exc.reason}") from exc
-        content = _extract_ollama_content(body)
+        content = _extract_ollama_content(body, model=model)
         if not content:
             thinking = _extract_ollama_thinking(body)
             if thinking:
@@ -967,16 +967,70 @@ def _is_gemma_thinking_candidate(model: str) -> bool:
     return ("gemma" in normalized or "gemass" in normalized) and ("26b" in normalized or "27b" in normalized)
 
 
-def _extract_ollama_content(body: dict[str, object]) -> str:
+def _extract_ollama_content(body: dict[str, object], *, model: str | None = None) -> str:
     message = body.get("message")
     if isinstance(message, dict):
         content = message.get("content")
         if isinstance(content, str):
-            return content.strip()
+            stripped = content.strip()
+            if stripped:
+                return stripped
     content = body.get("response")
     if isinstance(content, str):
-        return content.strip()
+        stripped = content.strip()
+        if stripped:
+            return stripped
+    if model and _is_gemma_model(model):
+        return _extract_gemma_final_answer(_extract_ollama_thinking(body))
     return ""
+
+
+def _extract_gemma_final_answer(text: str) -> str:
+    if not text:
+        return ""
+    markers = ("<channel|>", "<|channel>", "<channel>", "</channel>", "<final|>", "<|final>", "<final>")
+    latest_index = -1
+    latest_marker = ""
+    for marker in markers:
+        index = text.rfind(marker)
+        if index > latest_index:
+            latest_index = index
+            latest_marker = marker
+    if latest_index < 0:
+        return ""
+    answer = text[latest_index + len(latest_marker) :].strip()
+    for marker in markers:
+        if answer.startswith(marker):
+            answer = answer[len(marker) :].strip()
+    return _strip_gemma_control_tokens(answer)
+
+
+def _strip_gemma_control_tokens(text: str) -> str:
+    control_tokens = (
+        "<end_of_turn>",
+        "<eos>",
+        "<bos>",
+        "<start_of_turn>",
+        "<end_of_thought>",
+        "<|end|>",
+    )
+    cleaned = text.strip()
+    changed = True
+    while changed:
+        changed = False
+        for token in control_tokens:
+            if cleaned.startswith(token):
+                cleaned = cleaned[len(token) :].strip()
+                changed = True
+            if cleaned.endswith(token):
+                cleaned = cleaned[: -len(token)].strip()
+                changed = True
+    return cleaned
+
+
+def _is_gemma_model(model: str) -> bool:
+    normalized = model.lower()
+    return "gemma" in normalized or "gemass" in normalized
 
 
 def _extract_ollama_thinking(body: dict[str, object]) -> str:
