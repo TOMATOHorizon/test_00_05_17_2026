@@ -397,7 +397,7 @@ class RemoteH264Receiver:
         }
 
     def _call_ollama_vlm(self, jpeg: bytes, *, model: str, think: bool, isolate_context: bool) -> str:
-        user_content = ""
+        user_content = "请观察当前图像。若启用思考，请不要输出思考内容；最后必须在最终回答中给出 1-2 句简洁中文描述。"
         image_b64 = base64.b64encode(jpeg).decode("ascii")
         with self._vlm_lock:
             messages = [
@@ -429,9 +429,15 @@ class RemoteH264Receiver:
             raise RuntimeError(f"Ollama HTTP {exc.code}: {detail}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Ollama request failed: {exc.reason}") from exc
-        content = str(body.get("message", {}).get("content", "")).strip()
+        content = _extract_ollama_content(body)
         if not content:
-            raise RuntimeError("Ollama returned an empty description.")
+            thinking = _extract_ollama_thinking(body)
+            if thinking:
+                raise RuntimeError(
+                    "Ollama returned thinking but no final content. "
+                    "The hidden thinking was not shown; try the non-thinking model option or ask the model to produce a final answer."
+                )
+            raise RuntimeError(f"Ollama returned an empty description. Response keys: {sorted(body.keys())}")
         if not isolate_context:
             with self._vlm_lock:
                 self._vlm_messages.append({"role": "user", "content": user_content})
@@ -959,6 +965,30 @@ def decoded_frame_size(*, width: int, height: int, pixel_format: str) -> int:
 def _is_gemma_thinking_candidate(model: str) -> bool:
     normalized = model.lower().replace("_", "-")
     return ("gemma" in normalized or "gemass" in normalized) and ("26b" in normalized or "27b" in normalized)
+
+
+def _extract_ollama_content(body: dict[str, object]) -> str:
+    message = body.get("message")
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, str):
+            return content.strip()
+    content = body.get("response")
+    if isinstance(content, str):
+        return content.strip()
+    return ""
+
+
+def _extract_ollama_thinking(body: dict[str, object]) -> str:
+    message = body.get("message")
+    if isinstance(message, dict):
+        thinking = message.get("thinking")
+        if isinstance(thinking, str):
+            return thinking.strip()
+    thinking = body.get("thinking")
+    if isinstance(thinking, str):
+        return thinking.strip()
+    return ""
 
 
 def _close_process(process: subprocess.Popen[bytes]) -> None:

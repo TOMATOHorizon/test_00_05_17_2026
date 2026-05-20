@@ -199,6 +199,21 @@ def test_gemma_large_models_get_thinking_options():
     assert not any(option["value"] == "qwen3-vl:8b-instruct::thinking" for option in options)
 
 
+def test_ollama_content_extraction_ignores_thinking():
+    from window_frame_monitor.remote_stream import _extract_ollama_content, _extract_ollama_thinking
+
+    body = {"message": {"thinking": "hidden chain", "content": "visible answer"}}
+
+    assert _extract_ollama_content(body) == "visible answer"
+    assert _extract_ollama_thinking(body) == "hidden chain"
+
+
+def test_ollama_content_extraction_falls_back_to_response():
+    from window_frame_monitor.remote_stream import _extract_ollama_content
+
+    assert _extract_ollama_content({"response": "legacy answer"}) == "legacy answer"
+
+
 def test_remote_frame_store_keeps_disconnect_detail(tmp_path: Path):
     store = RemoteFrameStore(output_dir=tmp_path, width=16, height=16)
 
